@@ -358,7 +358,14 @@ public final class AppModel {
             return
         }
         if message.hasPrefix("healed:") {
-            if status == .recovering { status = .recording }
+            // Both states a heal can complete out of. `error` belongs
+            // here as much as `recovering` does: a heal that completes
+            // after a surrender is the evidence that the surrender is
+            // over (#109).
+            if status == .recovering || status == .error {
+                status = .recording
+                lastError = nil
+            }
             return
         }
         if message.hasPrefix("recovery_exhausted:") {

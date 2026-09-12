@@ -22,6 +22,16 @@ public actor RecordingEngine {
     // MARK: - Read-only state
 
     public private(set) var status: EngineStatus = .idle
+
+    /// The open session the engine is capturing into, or `nil` when
+    /// there is nothing to capture into.
+    ///
+    /// Load-bearing on the surrender paths: a transition to `.error`
+    /// tears the *pipelines* down but deliberately leaves this set. The
+    /// row is still `active` in the repository and the recovery paths
+    /// (wake, resume) rebuild around it rather than rolling the user's
+    /// transcript over on every recoverable fault. Only `stop()`,
+    /// `pause()`, and `cleanup()` clear it.
     public private(set) var currentSession: Session?
     public private(set) var currentDevice: String?
     public private(set) var isSystemAudioEnabled: Bool = false
@@ -200,6 +210,16 @@ public actor RecordingEngine {
     /// mic-pipeline rebuilds.
     private var micBackoff = BackoffPolicy()
     private var sysBackoff = BackoffPolicy()
+
+    /// Monotonic count of surrenders into `.error`, bumped by
+    /// `setStatus`. A bring-up compares the count it captured on entry
+    /// against the count on exit to tell "a concurrent path surrendered
+    /// *during* this rebuild" (do not claim `.recording`) from "we
+    /// entered this rebuild already surrendered" (a completed rebuild is
+    /// evidence the earlier error is resolved — claim `.recording`).
+    /// A plain `status != .error` check cannot separate the two, which
+    /// is what made `.error` absorbing across sleep/wake (#109).
+    private var errorEpoch: Int = 0
 
     /// In-flight restart tasks. While non-nil for a source, that source
     /// is mid-restart — additional errors arriving via the (already
@@ -534,6 +554,9 @@ public actor RecordingEngine {
         device: String?,
         systemAudio: Bool
     ) async throws -> Session {
+        // Snapshot before anything can surrender. Read again at the tail
+        // to decide whether this rebuild is allowed to claim `.recording`.
+        let entryErrorEpoch = errorEpoch
         currentSession = session
         currentDevice = device
         currentLocale = locale
@@ -627,7 +650,18 @@ public actor RecordingEngine {
         // since `handleDisplayBecameAvailable()` refuses to act on a
         // pipeline that was never parked. The mic path never reaches
         // here in `.error`; it throws instead.
-        if status != .error {
+        //
+        // The test is the *epoch*, not the status. Gating on
+        // `status != .error` also blocked the bring-up that runs on wake
+        // out of a pre-existing `.error` (#109): the pipelines rebuild
+        // successfully, but the engine keeps reporting `error`, emits no
+        // `statusChanged` for any client to correct itself against, and
+        // never re-takes the power assertion — so the machine is free to
+        // sleep again while capture is live. Reaching this line is
+        // positive evidence that the pipelines are up, and an unchanged
+        // epoch says no new surrender happened on the way here, so the
+        // earlier error is resolved.
+        if errorEpoch == entryErrorEpoch {
             await setStatus(.recording)
         }
         return session
@@ -1000,6 +1034,12 @@ public actor RecordingEngine {
     private func setStatus(_ newStatus: EngineStatus) async {
         let previous = status
         status = newStatus
+        // Counted, not compared: two surrenders in a row are two
+        // distinct events even though the status never moves. See
+        // `errorEpoch`.
+        if newStatus == .error {
+            errorEpoch += 1
+        }
         // U6: power assertion lifecycle. Take on entry into `.recording`,
         // release on every transition OUT of `.recording`. Idempotent in
         // both directions so concurrent rebuild paths can call freely
@@ -2532,11 +2572,21 @@ public actor RecordingEngine {
         }
 
         guard let session = currentSession else {
-            // Status was non-.recording at sleep-time (e.g. error). Stay
-            // wherever we are; the engine-recovery path (plan "Engine-state
-            // recovery from `error`") drives a re-attempt elsewhere.
+            // No session to rebuild around. A surrender into `.error`
+            // deliberately keeps `currentSession` (see its declaration),
+            // so reaching here means the session was closed by `stop()`,
+            // `pause()`, or a `cleanup()` — there is nothing to resume
+            // and an explicit `start` is required.
             return
         }
+
+        // A wake is a full rebuild, so it gets a full retry budget, for
+        // the same reason `start()` and `resume()` reset here: a prior
+        // surrender leaves `isExhausted == true`, and the first
+        // post-wake hiccup would short-circuit straight back to
+        // `recoveryExhausted` against a budget spent before the sleep.
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
 
         let gap = nowProvider().timeIntervalSince(gapStarted)
         let currentDeviceUID = captureDeviceUID(observed: deviceUIDProvider())

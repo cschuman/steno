@@ -1192,11 +1192,19 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			return nil
 
 		case strings.HasPrefix(ev.Message, "healed:"):
-			// The pipeline restart succeeded. If we're still in
-			// recovering, drop back to recording. The next `status`
-			// event will reaffirm.
-			if m.engineStatus == StatusRecovering {
+			// The pipeline restart succeeded. Drop back to recording
+			// from either of the two states a heal can complete out
+			// of. The next `status` event will reaffirm.
+			//
+			// `error` belongs here as much as `recovering` does: a
+			// heal that completes after a surrender is exactly the
+			// evidence that the surrender is over, and dropping it
+			// left the header pinned to `error` while transcription
+			// visibly continued (#109).
+			if m.engineStatus == StatusRecovering || m.engineStatus == StatusError {
 				m.engineStatus = StatusRecording
+				m.errorMessage = ""
+				m.errorTransient = false
 			}
 			// Refresh segment list from the DB so heal_marker columns
 			// arrive via SegmentsForRange / DB refresh paths. For now

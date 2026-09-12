@@ -547,4 +547,77 @@ struct SleepWakeHandlerTests {
 
         await engine.stop()
     }
+
+    // MARK: - #109: wake out of `.error`
+
+    /// Regression test for the stuck `error` status (issue #109).
+    ///
+    /// `.error` used to be an absorbing state. The tail of
+    /// `bringUpPipelines` was gated on `status != .error`, and that was
+    /// the *only* path back to `.recording` a wake could take, so an
+    /// engine that surrendered before sleeping came back with working
+    /// pipelines and a status that still read `error` — for days,
+    /// because the status never moved, no `statusChanged` was emitted
+    /// for a client to correct itself against, and `setStatus`'s entry
+    /// into `.recording` is the one place the power assertion is taken.
+    /// The machine was then free to sleep again while capture was live.
+    ///
+    /// Both halves are asserted here: the status comes back, and so
+    /// does the power assertion.
+    @Test("Wake out of .error with a successful rebuild restores .recording and re-takes the power assertion")
+    func wakeOutOfErrorRestoresRecordingAndPowerAssertion() async throws {
+        let (engine, _, af, _, _, power) = await makeEngine()
+
+        // Surrender the way production does: a revoked Screen Recording
+        // grant during bring-up sets `.error` inline and leaves
+        // `currentSession` live.
+        af.systemAudioSource.errorToThrow = SystemAudioError.permissionDenied
+        _ = try await engine.start(systemAudio: true)
+
+        let surrendered = await engine.status
+        #expect(surrendered == .error, "precondition: the engine must be surrendered before sleeping")
+        #expect(await engine.currentSession != nil, "precondition: a surrender keeps the session as the recovery anchor")
+        #expect(!power.isAcquired, "precondition: no assertion is held in .error")
+
+        // Whatever was wrong is resolved while the machine is asleep —
+        // the grant is restored, the device is unplugged and back, the
+        // driver is reloaded. The wake rebuild is the first thing that
+        // can observe it.
+        af.systemAudioSource.errorToThrow = nil
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let status = await engine.status
+        #expect(status == .recording, "a completed rebuild is evidence the error is resolved")
+        #expect(power.isAcquired, "the power assertion must be re-taken or the Mac sleeps again mid-recording")
+        #expect(power.acquireTimestamps.count == 1)
+
+        await engine.stop()
+    }
+
+    /// The other half of the same rule: a rebuild that surrenders *again*
+    /// must not be allowed to claim `.recording`. This is what the
+    /// original `status != .error` guard was protecting, and widening the
+    /// exit from `.error` must not cost it.
+    @Test("Wake out of .error into a still-broken pipeline stays in .error")
+    func wakeOutOfErrorIntoAnotherSurrenderStaysInError() async throws {
+        let (engine, _, af, _, _, power) = await makeEngine()
+
+        af.systemAudioSource.errorToThrow = SystemAudioError.permissionDenied
+        _ = try await engine.start(systemAudio: true)
+        #expect(await engine.status == .error)
+
+        // The grant is still revoked across the sleep, so the rebuild
+        // surrenders a second time. The status never moves, which is
+        // exactly why the guard counts surrenders instead of reading it.
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let status = await engine.status
+        #expect(status == .error, "an unresolved fault must not be papered over with .recording")
+        #expect(!power.isAcquired, "no assertion may be held while surrendered")
+
+        await engine.stop()
+    }
 }
