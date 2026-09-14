@@ -376,7 +376,7 @@ public actor RecordingEngine {
         },
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
-        healThresholdSeconds: Int = 30,
+        healThresholdSeconds: Int = StenoSettings.defaultHealGapSeconds,
         audioBacklogCapSeconds: Double = 0,
         now: @Sendable @escaping () -> Date = { Date() },
         dedupCoordinator: DedupCoordinator? = nil,

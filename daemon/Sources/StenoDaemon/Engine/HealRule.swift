@@ -28,9 +28,10 @@ public enum HealOutcome: Sendable, Equatable {
 /// device change (we do not know whether the device changed, so we err
 /// on the safer side: rollover).
 ///
-/// The 30-second threshold is configurable via `StenoSettings.healGapSeconds`
+/// The threshold is configurable via `StenoSettings.healGapSeconds`
 /// (call site reads the setting; this type only takes the resolved
 /// threshold as a parameter so the rule itself is purely functional).
+/// `StenoSettings.defaultHealGapSeconds` is the shipped value.
 public enum HealRule {
 
     /// Apply the heal rule.
@@ -42,8 +43,9 @@ public enum HealRule {
     ///     Core Audio HAL on wake. `nil` if unknown.
     ///   - lastDeviceUID: The device UID captured at the last successful
     ///     pipeline bring-up. `nil` if never captured.
-    ///   - thresholdSeconds: The reuse-window threshold. Default 30s
-    ///     (R5). Configurable via `StenoSettings.healGapSeconds`.
+    ///   - thresholdSeconds: The reuse-window threshold. Configurable
+    ///     via `StenoSettings.healGapSeconds`; the shipped default is
+    ///     `StenoSettings.defaultHealGapSeconds`.
     /// - Returns: `.reuseSession(healMarker:)` or `.rollover`.
     public static func decide(
         gap: TimeInterval,
