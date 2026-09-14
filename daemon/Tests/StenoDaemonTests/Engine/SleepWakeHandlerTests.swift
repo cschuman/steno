@@ -81,7 +81,8 @@ struct SleepWakeHandlerTests {
         repo: MockTranscriptRepository? = nil,
         delegate: MockRecordingEngineDelegate? = nil,
         powerAssertion: MockPowerAssertion = MockPowerAssertion(),
-        deviceUIDProvider: @Sendable @escaping () -> String? = { "BuiltInMic" }
+        deviceUIDProvider: @Sendable @escaping () -> String? = { "BuiltInMic" },
+        reArmIdleOnWake: Bool = true
     ) async -> (
         engine: RecordingEngine,
         repo: MockTranscriptRepository,
@@ -121,7 +122,8 @@ struct SleepWakeHandlerTests {
             now: { Date() },
             emptySessionMinChars: 0,
             emptySessionMinDurationSeconds: 0,
-            retentionDays: 0
+            retentionDays: 0,
+            reArmIdleOnWake: reArmIdleOnWake
         )
         return (engine, actualRepo, af, recognizerFactory, del, powerAssertion)
     }
@@ -546,5 +548,186 @@ struct SleepWakeHandlerTests {
         #expect(Set(allSeqs).count == allSeqs.count)
 
         await engine.stop()
+    }
+
+    // MARK: - #111: `.idle` is absorbing after an external stop
+
+    /// The always-on model (#32) has no user-facing stop, but `stop` is
+    /// still a valid wire command and any client can send one. Before this
+    /// fix, that put the engine in `.idle` for the life of the daemon
+    /// process: `stop()` nils `currentSession`, so the wake handler bailed
+    /// at its `guard let session` and nothing else ever re-entered
+    /// `.recording`. A wake is the natural moment to re-apply the
+    /// always-on arm rule, and it is the same rule the daemon-start path
+    /// already runs.
+    @Test("Wake from .idle after a stop re-arms always-on capture")
+    func wakeFromIdleReArms() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // initial start
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // post-wake re-arm
+
+        let (engine, repo, _, _, delegate, power) = await makeEngine(
+            recognizerFactory: rf
+        )
+
+        _ = try await engine.start()
+        await engine.stop()
+        var status = await engine.status
+        #expect(status == .idle)
+        #expect(!power.isAcquired)
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let rearmed = await waitFor {
+            let s = await engine.status
+            return s == .recording
+        }
+        #expect(rearmed)
+
+        status = await engine.status
+        #expect(status == .recording)
+        // The power assertion is taken only on entry to `.recording`, so
+        // holding it again is independent proof the transition happened.
+        #expect(power.isAcquired)
+
+        // A fresh session, not a resurrection of the stopped one.
+        let sessions = try await repo.allSessions()
+        #expect(sessions.count == 2)
+        #expect(sessions.filter { $0.endedAt == nil }.count == 1)
+
+        // The re-arm is announced, so a connected client can correct itself.
+        let reasons = await delegate.recoveringReasons
+        #expect(reasons.contains { $0.contains("rearm") })
+
+        await engine.stop()
+    }
+
+    /// The privacy invariant. `stop()` from `.paused` clears the in-memory
+    /// pause markers and lands in `.idle`, but deliberately leaves the DB
+    /// anchor (`paused_indefinitely` / `pause_expires_at`) on the row. A
+    /// re-arm that only looked at engine state would therefore resurrect
+    /// capture on a machine the user had explicitly paused. The re-arm
+    /// must consult the same anchor the daemon-start path checks.
+    @Test("Wake from .idle does NOT re-arm while a pause anchor is still active")
+    func wakeFromIdleRespectsPauseAnchor() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())
+
+        let (engine, _, _, _, _, power) = await makeEngine(
+            recognizerFactory: rf
+        )
+
+        _ = try await engine.start()
+        try await engine.pause(autoResumeSeconds: nil) // indefinite: writes the anchor
+        await engine.stop()                            // .paused -> .idle, anchor survives
+
+        var status = await engine.status
+        #expect(status == .idle)
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        // Give a re-arm the chance to happen so this is a real assertion
+        // about behaviour rather than about timing.
+        try await Task.sleep(for: .milliseconds(150))
+
+        status = await engine.status
+        #expect(status == .idle)
+        #expect(!power.isAcquired)
+    }
+
+    /// A timed pause whose deadline has already passed is not an active
+    /// anchor, so the same wake re-arms normally.
+    @Test("Wake from .idle re-arms when the pause anchor has expired")
+    func wakeFromIdleReArmsPastExpiredPauseAnchor() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())
+
+        let (engine, repo, _, _, _, _) = await makeEngine(
+            recognizerFactory: rf
+        )
+
+        let session = try await engine.start()
+        await engine.stop()
+
+        // Stamp an anchor that expired in the past.
+        try await repo.setPauseState(
+            sessionId: session.id,
+            expiresAt: Date().addingTimeInterval(-60),
+            indefinite: false
+        )
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let rearmed = await waitFor {
+            let s = await engine.status
+            return s == .recording
+        }
+        #expect(rearmed)
+
+        await engine.stop()
+    }
+
+    /// Fail-safe. If the pause anchor cannot be read we cannot prove the
+    /// user is not paused, so we stay idle and say so, rather than
+    /// defaulting to "resume into recording." Same posture as the
+    /// daemon-start path's `pause_state_unverifiable` branch.
+    @Test("Wake from .idle does not re-arm when the pause anchor is unreadable")
+    func wakeFromIdleFailsSafeOnUnreadablePauseAnchor() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())
+
+        let (engine, repo, _, _, delegate, power) = await makeEngine(
+            recognizerFactory: rf
+        )
+
+        _ = try await engine.start()
+        await engine.stop()
+
+        struct ReadFailure: Error {}
+        await repo.setMostRecentlyModifiedSessionError(ReadFailure())
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        try await Task.sleep(for: .milliseconds(150))
+
+        let status = await engine.status
+        #expect(status == .idle)
+        #expect(!power.isAcquired)
+
+        // Surfaced as a non-transient warning carrying the same token the
+        // daemon-start path uses, so U9/U10's health-warning machinery
+        // already matches on it.
+        let errors = await delegate.errors
+        #expect(errors.contains { $0.0.contains("pause_state_unverifiable") && !$0.1 })
+    }
+
+    /// The escape hatch. `reArmIdleOnWake = false` restores the old
+    /// behaviour for anyone who wants `stop` to mean stop.
+    @Test("Wake from .idle does not re-arm when reArmIdleOnWake is disabled")
+    func wakeFromIdleRespectsDisabledSetting() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())
+
+        let (engine, _, _, _, _, power) = await makeEngine(
+            recognizerFactory: rf,
+            reArmIdleOnWake: false
+        )
+
+        _ = try await engine.start()
+        await engine.stop()
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        try await Task.sleep(for: .milliseconds(150))
+
+        let status = await engine.status
+        #expect(status == .idle)
+        #expect(!power.isAcquired)
     }
 }

@@ -98,6 +98,13 @@ public actor RecordingEngine {
     /// `StenoSettings.healGapSeconds` at construction time.
     private let healThresholdSeconds: Int
 
+    /// #111 — whether a wake re-applies the always-on arm rule when the
+    /// engine is sitting in `.idle`. `.idle` is reachable only from
+    /// `stop()`, which any client can send, and nothing else ever leaves
+    /// it; without this the daemon stays dark for the life of the
+    /// process. Set `false` to keep `stop` terminal.
+    private let reArmIdleOnWake: Bool
+
     /// Lists the machine's input devices for `availableDevices()` (#104).
     /// Injected because Core Audio enumeration needs real hardware.
     private let deviceEnumerator: any AudioInputDeviceEnumerating
@@ -384,6 +391,7 @@ public actor RecordingEngine {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         retentionDays: Int = 90,
+        reArmIdleOnWake: Bool = true,
         pauseTimer: PauseTimer? = nil,
         transcriptionGate: TranscriptionModelGate = ReadyTranscriptionModelGate(),
         micDiarizer: (any DiarizationService)? = nil,
@@ -413,6 +421,7 @@ public actor RecordingEngine {
         self.retentionDays = retentionDays
         self.pauseTimer = pauseTimer ?? PauseTimer()
         self.deviceEnumerator = deviceEnumerator
+        self.reArmIdleOnWake = reArmIdleOnWake
         // The watchdog counts level-throttle ticks, so convert the
         // caller's duration into ticks at the throttle's fixed rate.
         let warnSeconds = Double(micSilenceWarnAfter.components.seconds)
@@ -756,10 +765,8 @@ public actor RecordingEngine {
         // warning, requires explicit user resume. This closes the
         // privacy-violation path in plan-risk R-F where a corrupted /
         // unmigrated row could otherwise default to "resume into recording."
-        let mostRecent: Session?
-        do {
-            mostRecent = try await repository.mostRecentlyModifiedSession()
-        } catch {
+        switch await pauseAnchorState() {
+        case .unverifiable(let error):
             // Fail-safe: stay paused (engine `.idle`). The orphan sweep has
             // already committed (step 1). Surface a non-transient warning
             // whose message contains the exact `pause_state_unverifiable`
@@ -772,35 +779,32 @@ public actor RecordingEngine {
                 isTransient: false
             ))
             return nil
-        }
 
-        if let mostRecent {
-            let now = Date()
-            let pauseStillActive = mostRecent.pausedIndefinitely
-                || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
-            if pauseStillActive {
-                // U10: restore the paused engine state from the persisted
-                // DB row. Re-arms the wall-clock timer for the remaining
-                // window (timed pauses) or stays paused indefinitely. The
-                // privacy invariant: we do NOT bring up pipelines.
-                await emit(.error(
-                    "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
-                    ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
-                    " — restoring paused engine state",
-                    isTransient: false
-                ))
-                // Pre-populate locale + last-known device so a future
-                // resume bringup uses the same configuration.
-                currentLocale = mostRecent.locale
-                lastUsedDevice = device
-                lastUsedSystemAudio = systemAudio
-                await restorePausedState(
-                    sessionId: mostRecent.id,
-                    expiresAt: mostRecent.pauseExpiresAt,
-                    indefinite: mostRecent.pausedIndefinitely
-                )
-                return nil
-            }
+        case .active(let mostRecent):
+            // U10: restore the paused engine state from the persisted
+            // DB row. Re-arms the wall-clock timer for the remaining
+            // window (timed pauses) or stays paused indefinitely. The
+            // privacy invariant: we do NOT bring up pipelines.
+            await emit(.error(
+                "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
+                ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
+                " — restoring paused engine state",
+                isTransient: false
+            ))
+            // Pre-populate locale + last-known device so a future
+            // resume bringup uses the same configuration.
+            currentLocale = mostRecent.locale
+            lastUsedDevice = device
+            lastUsedSystemAudio = systemAudio
+            await restorePausedState(
+                sessionId: mostRecent.id,
+                expiresAt: mostRecent.pauseExpiresAt,
+                indefinite: mostRecent.pausedIndefinitely
+            )
+            return nil
+
+        case .inactive:
+            break
         }
 
         await setStatus(.starting)
@@ -2435,6 +2439,99 @@ public actor RecordingEngine {
         }
     }
 
+    /// The persisted pause anchor, which is the only durable record of
+    /// user intent to stop capturing.
+    ///
+    /// U10 writes `pause_expires_at` / `paused_indefinitely` onto the
+    /// session row, and that row outlives both the engine's in-memory
+    /// pause markers and the daemon process itself. Engine status alone
+    /// cannot stand in for it: `stop()` from `.paused`
+    /// clears the in-memory markers and lands in `.idle`, deliberately
+    /// leaving the row as-is, so a stopped-while-paused engine is
+    /// indistinguishable from a plainly stopped one until you read the row.
+    private enum PauseAnchorState {
+        /// The user is paused and capture must not resume on its own.
+        case active(Session)
+        /// No pause in force (no anchor, or a timed one that has expired).
+        case inactive
+        /// The anchor could not be read, so we cannot prove the user is
+        /// not paused. Callers must treat this as "stay stopped."
+        case unverifiable(Error)
+    }
+
+    /// Read the pause anchor. Shared by the daemon-start auto-start path
+    /// and the #111 wake re-arm so the two cannot drift apart — they are
+    /// the same question ("may this daemon begin capturing on its own?")
+    /// asked at two different moments.
+    private func pauseAnchorState() async -> PauseAnchorState {
+        let mostRecent: Session?
+        do {
+            mostRecent = try await repository.mostRecentlyModifiedSession()
+        } catch {
+            return .unverifiable(error)
+        }
+        guard let mostRecent else { return .inactive }
+        let now = nowProvider()
+        let stillActive = mostRecent.pausedIndefinitely
+            || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
+        return stillActive ? .active(mostRecent) : .inactive
+    }
+
+    /// #111 — re-apply the always-on arm rule after a wake that found the
+    /// engine `.idle`.
+    ///
+    /// This is deliberately the *same* rule as daemon start rather than an
+    /// unconditional `start()`: the pause anchor is the privacy invariant
+    /// and it has to be honoured identically at both moments. A failure
+    /// here is not fatal; the engine stays where it is and the next wake
+    /// tries again.
+    private func reArmIdleAfterWake() async {
+        guard reArmIdleOnWake else { return }
+
+        switch await pauseAnchorState() {
+        case .active:
+            // The user paused. `stop()` cleared the in-memory markers but
+            // not the row, and the row is what counts. Staying idle here is
+            // the whole reason this path reads the DB instead of trusting
+            // engine state.
+            return
+
+        case .unverifiable(let error):
+            // Same posture as daemon start: unreadable is not permission.
+            // Carries the `pause_state_unverifiable` token so the existing
+            // U9/U10 health-warning surfaces match on it unchanged.
+            await emit(.error(
+                "pause_state_unverifiable: failed to read pause columns on wake" +
+                " (\(error.localizedDescription)). Capture stays stopped;" +
+                " explicit start required.",
+                isTransient: false
+            ))
+            return
+
+        case .inactive:
+            break
+        }
+
+        await emit(.recovering(reason: "wake:rearm-from-idle"))
+
+        do {
+            try await start(
+                locale: currentLocale,
+                device: lastUsedDevice,
+                systemAudio: lastUsedSystemAudio
+            )
+        } catch {
+            // `start()` has already set `.error` (or `.unsupported`) and
+            // emitted its own detail. Report the re-arm attempt as
+            // transient — the next wake retries, and on `.unsupported` the
+            // status itself is the durable signal.
+            await emit(.error(
+                "Re-arm after wake failed: \(error.localizedDescription)",
+                isTransient: true
+            ))
+        }
+    }
+
     // MARK: - U6 Sleep/Wake Handlers
 
     /// Called on `kIOMessageSystemWillSleep` (wired via
@@ -2528,6 +2625,19 @@ public actor RecordingEngine {
         // sleep, so it fires on its own when the deadline lands. We do
         // NOT bring up pipelines while paused — the privacy invariant.
         if status == .paused {
+            return
+        }
+
+        // #111: `.idle` is reachable only from `stop()`, and nothing else
+        // ever leaves it — the `guard let session` below is exactly where an
+        // idle engine used to end its wake, because `stop()` nils
+        // `currentSession`. Under always-on (#32) a `stop` from any client
+        // would therefore disable capture for the life of the daemon
+        // process. A wake re-applies the same arm rule the daemon-start path
+        // runs. Checked before the session guard because an idle engine has
+        // no session by construction.
+        if status == .idle {
+            await reArmIdleAfterWake()
             return
         }
 

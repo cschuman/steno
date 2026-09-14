@@ -123,6 +123,19 @@ public struct StenoSettings: Codable, Sendable {
     /// rolling window for privacy or storage reasons.
     public var retentionDays: Int
 
+    /// #111 — whether a wake re-applies the always-on arm rule when the
+    /// engine is sitting in `.idle`.
+    ///
+    /// `.idle` is reachable only from `stop()`. Always-on recording (#32)
+    /// has no user-facing stop, but `stop` is still a valid wire command
+    /// and nothing in the engine ever leaves `.idle` on its own, so a stop
+    /// from any client otherwise disables capture for the life of the
+    /// daemon process. A wake re-runs the same check daemon start does,
+    /// including the persisted pause anchor, so an explicit `pause` is
+    /// still honoured. Set `false` to keep `stop` terminal.
+    /// Default: `true`.
+    public var reArmIdleOnWake: Bool
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
@@ -138,7 +151,8 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
-        retentionDays: Int = 0
+        retentionDays: Int = 0,
+        reArmIdleOnWake: Bool = true
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -155,6 +169,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.topicExtractionMinSegments = topicExtractionMinSegments
         self.retentionDays = retentionDays
+        self.reArmIdleOnWake = reArmIdleOnWake
     }
 
     // MARK: - Codable
@@ -178,6 +193,7 @@ public struct StenoSettings: Codable, Sendable {
         case emptySessionMinDurationSeconds
         case topicExtractionMinSegments
         case retentionDays
+        case reArmIdleOnWake
     }
 
     public init(from decoder: Decoder) throws {
@@ -199,6 +215,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
+        self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? true
     }
 
     // MARK: - Persistence
