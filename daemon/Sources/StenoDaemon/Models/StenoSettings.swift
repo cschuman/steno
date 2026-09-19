@@ -132,8 +132,14 @@ public struct StenoSettings: Codable, Sendable {
     /// from any client otherwise disables capture for the life of the
     /// daemon process. A wake re-runs the same check daemon start does,
     /// including the persisted pause anchor, so an explicit `pause` is
-    /// still honoured. Set `false` to keep `stop` terminal.
-    /// Default: `true`.
+    /// still honoured.
+    ///
+    /// #113 review fix: default is `false`. A plain `stop()` and a
+    /// privacy-motivated `stop()` are the same wire command — this layer
+    /// cannot tell an incidental script/test stop from a deliberate one,
+    /// so the safe default is to keep `stop` terminal and require an
+    /// explicit opt-in (`true`) for the self-healing behavior.
+    /// Default: `false`.
     public var reArmIdleOnWake: Bool
 
     public init(
@@ -152,7 +158,7 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
         retentionDays: Int = 0,
-        reArmIdleOnWake: Bool = true
+        reArmIdleOnWake: Bool = false
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -215,7 +221,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
-        self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? true
+        self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? false
     }
 
     // MARK: - Persistence

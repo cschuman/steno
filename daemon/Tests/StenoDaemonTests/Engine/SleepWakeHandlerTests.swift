@@ -730,4 +730,93 @@ struct SleepWakeHandlerTests {
         #expect(status == .idle)
         #expect(!power.isAcquired)
     }
+
+    /// #113 review fix. A re-arm attempt that itself fails (e.g. a
+    /// transient audio-source error right after wake) lands the engine
+    /// in `.error`, not back in `.idle`. `handleSystemDidWake()` only
+    /// retried from `.idle`, so before this fix a single failed re-arm
+    /// silently stopped retrying on every later wake — contradicting
+    /// `reArmIdleAfterWake`'s own comment that "the next wake tries
+    /// again." This proves the daemon self-heals on the wake *after*
+    /// the failure, not just the one where it first fails.
+    @Test("A failed re-arm attempt is retried on the next wake, not abandoned")
+    func wakeRetriesAFailedReArmOnTheNextWake() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // initial start
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // second wake: retry succeeds
+
+        let af = MockAudioSourceFactory()
+
+        let (engine, _, _, _, _, power) = await makeEngine(
+            recognizerFactory: rf,
+            audioFactory: af,
+            reArmIdleOnWake: true
+        )
+
+        _ = try await engine.start()
+        await engine.stop()
+        #expect(await engine.status == .idle)
+
+        // First wake: the re-arm's own start() attempt fails.
+        af.micErrorQueue = [MockAudioSourceFactory.InjectedError("boom")]
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let failed = await waitFor {
+            let s = await engine.status
+            return s == .error
+        }
+        #expect(failed)
+        #expect(!power.isAcquired)
+
+        // Second wake: no injected failure this time. Without the fix,
+        // `handleSystemDidWake()` sees `.error` (not `.idle`), never
+        // calls `reArmIdleAfterWake()` again, and the engine stays dark
+        // forever.
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let recovered = await waitFor {
+            let s = await engine.status
+            return s == .recording
+        }
+        #expect(recovered)
+        #expect(power.isAcquired)
+
+        await engine.stop()
+    }
+
+    /// #113 review fix. `.error` states unrelated to a re-arm attempt
+    /// (e.g. a revoked permission's `recoveryExhausted`) must NOT be
+    /// retried on wake — that class of failure is documented to require
+    /// manual resolution. The retry flag introduced to fix the above is
+    /// scoped to re-arm failures specifically; this pins that it does
+    /// not accidentally widen wake into a general `.error` retry point.
+    @Test("Wake does not retry an .error state that did not come from a re-arm attempt")
+    func wakeDoesNotRetryUnrelatedErrorState() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        // No enqueued handle: the one and only start() call fails,
+        // landing the engine in `.error` with no re-arm involved.
+        let af = MockAudioSourceFactory()
+        af.micError = MockAudioSourceFactory.InjectedError("permission denied")
+
+        let (engine, _, _, _, _, power) = await makeEngine(
+            recognizerFactory: rf,
+            audioFactory: af,
+            reArmIdleOnWake: true
+        )
+
+        await #expect(throws: RecordingEngineError.self) {
+            try await engine.start()
+        }
+        #expect(await engine.status == .error)
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(await engine.status == .error)
+        #expect(!power.isAcquired)
+    }
 }

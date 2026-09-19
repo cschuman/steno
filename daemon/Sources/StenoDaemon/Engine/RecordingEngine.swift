@@ -102,8 +102,32 @@ public actor RecordingEngine {
     /// engine is sitting in `.idle`. `.idle` is reachable only from
     /// `stop()`, which any client can send, and nothing else ever leaves
     /// it; without this the daemon stays dark for the life of the
-    /// process. Set `false` to keep `stop` terminal.
+    /// process.
+    ///
+    /// #113 review fix — defaults to `false`. An explicit `stop()` is
+    /// the same wire command whether it came from a script that forgot
+    /// to restart the daemon or from a user/MCP caller deliberately
+    /// ending capture for privacy. Nothing at this layer can tell those
+    /// apart, and silently resuming on the next wake is the wrong
+    /// default when one of those callers meant it — recording without
+    /// consent after an explicit stop is a privacy regression, not a
+    /// convenience. Operators who want the old self-healing behavior
+    /// (and accept that a privacy-motivated `stop` will also be
+    /// re-armed) can opt in with `true`.
     private let reArmIdleOnWake: Bool
+
+    /// #113 review fix — true only when the most recent transition into
+    /// `.error` was caused by `reArmIdleAfterWake()`'s own `start()` call
+    /// failing (reset to `false` on every OTHER entry into `.error`, see
+    /// `setStatus`). `handleSystemDidWake()` normally only retries from
+    /// `.idle`; a failed re-arm attempt lands in `.error` instead, which
+    /// fell outside that check and silently stopped retrying on every
+    /// later wake despite this file's own comment promising "the next
+    /// wake tries again." This flag is what actually keeps that promise,
+    /// without turning wake into a retry point for `.error` states that
+    /// are supposed to require manual resolution (e.g. a revoked
+    /// permission's `recoveryExhausted`).
+    private var wakeRearmFailed = false
 
     /// Lists the machine's input devices for `availableDevices()` (#104).
     /// Injected because Core Audio enumeration needs real hardware.
@@ -391,7 +415,7 @@ public actor RecordingEngine {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         retentionDays: Int = 90,
-        reArmIdleOnWake: Bool = true,
+        reArmIdleOnWake: Bool = false,
         pauseTimer: PauseTimer? = nil,
         transcriptionGate: TranscriptionModelGate = ReadyTranscriptionModelGate(),
         micDiarizer: (any DiarizationService)? = nil,
@@ -1004,6 +1028,15 @@ public actor RecordingEngine {
     private func setStatus(_ newStatus: EngineStatus) async {
         let previous = status
         status = newStatus
+        // #113 review fix: any entry into `.error` clears the wake-retry
+        // flag by default. `reArmIdleAfterWake()`'s own catch block sets
+        // it back to `true` immediately after this call returns when
+        // IT was the cause, so the flag ends up `true` only for that one
+        // cause and `false` for every other path into `.error` (revoked
+        // permission, failed session creation outside a re-arm, etc).
+        if newStatus == .error {
+            wakeRearmFailed = false
+        }
         // U6: power assertion lifecycle. Take on entry into `.recording`,
         // release on every transition OUT of `.recording`. Idempotent in
         // both directions so concurrent rebuild paths can call freely
@@ -2529,6 +2562,14 @@ public actor RecordingEngine {
                 "Re-arm after wake failed: \(error.localizedDescription)",
                 isTransient: true
             ))
+            // #113 review fix: `setStatus(.error)` (called inside the
+            // failed `start()`) already reset this to `false`. Set it
+            // back to `true` here, after the fact, so `handleSystemDidWake`
+            // knows THIS `.error` came from a re-arm attempt and retries
+            // on the next wake instead of going dark.
+            if status == .error {
+                wakeRearmFailed = true
+            }
         }
     }
 
@@ -2636,7 +2677,17 @@ public actor RecordingEngine {
         // process. A wake re-applies the same arm rule the daemon-start path
         // runs. Checked before the session guard because an idle engine has
         // no session by construction.
-        if status == .idle {
+        // #113 review fix: also retry from `.error` when THIS is a
+        // failed re-arm attempt's own error (`wakeRearmFailed`), not just
+        // from `.idle`. Without the second half of this condition, a
+        // re-arm that itself threw (e.g. a transient permission or
+        // session-creation failure right after wake) parked the engine
+        // in `.error` — which this check didn't cover — and every later
+        // wake silently gave up instead of retrying, contradicting
+        // `reArmIdleAfterWake`'s own "next wake tries again" comment.
+        // `.error` states from other causes (revoked permission, etc.)
+        // leave `wakeRearmFailed == false` and are correctly excluded.
+        if status == .idle || (status == .error && wakeRearmFailed) {
             await reArmIdleAfterWake()
             return
         }
