@@ -2,7 +2,7 @@
        sign-daemon sign-daemon-debug \
        run-daemon run-steno run-mcp \
        build-app run-app test-app clean-app \
-       test test-daemon test-steno \
+       test test-daemon test-steno test-live \
        clean install
 
 # Directories
@@ -137,7 +137,20 @@ test-steno:
 	# drive the single shared steno-daemon over its socket, so running them
 	# concurrently means one package's recording state decides whether the
 	# other's tests pass (#87).
+	#
+	# STENO_LIVE_TESTS is deliberately NOT set here. The mutating
+	# live-daemon tests stop and start the real daemon, and on a developer
+	# Mac that is the daemon recording the developer (#110). `make test` is
+	# the pre-push gate and has to be safe to run at any moment; use
+	# `make test-live` to include them.
 	cd $(STENO_DIR) && go test -p 1 ./...
+
+# Opt in to the mutating live-daemon tests. These stop and start the real
+# daemon on this machine. They restore the state they found, but the
+# session they interrupt is closed for good — a `stop` ends a session and
+# nothing can reopen it. Skips itself if the daemon is paused.
+test-live:
+	cd $(STENO_DIR) && STENO_LIVE_TESTS=1 go test -p 1 -count=1 ./...
 
 # --- Clean ---
 
