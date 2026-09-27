@@ -16,6 +16,11 @@ public enum DaemonPaths {
         baseDirectory.appendingPathComponent("steno.sqlite")
     }
 
+    /// Settings path: ~/Library/Application Support/Steno/settings.json
+    public static var settingsURL: URL {
+        baseDirectory.appendingPathComponent("settings.json")
+    }
+
     /// Socket path: ~/Library/Application Support/Steno/steno.sock
     public static var socketPath: String {
         baseDirectory.appendingPathComponent("steno.sock").path

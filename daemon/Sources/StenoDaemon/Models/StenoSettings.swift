@@ -242,33 +242,4 @@ public struct StenoSettings: Codable, Sendable {
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
         self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? false
     }
-
-    // MARK: - Persistence
-
-    private static var settingsURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let stenoDir = appSupport.appendingPathComponent("Steno")
-        return stenoDir.appendingPathComponent("settings.json")
-    }
-
-    /// Load settings from disk, or return defaults if not found.
-    public static func load() -> StenoSettings {
-        do {
-            let data = try Data(contentsOf: settingsURL)
-            return try JSONDecoder().decode(StenoSettings.self, from: data)
-        } catch {
-            return StenoSettings()
-        }
-    }
-
-    /// Save settings to disk.
-    public func save() throws {
-        let url = Self.settingsURL
-        let directory = url.deletingLastPathComponent()
-
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        let data = try JSONEncoder().encode(self)
-        try data.write(to: url)
-    }
 }
