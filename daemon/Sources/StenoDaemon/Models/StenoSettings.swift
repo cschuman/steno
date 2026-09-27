@@ -123,6 +123,24 @@ public struct StenoSettings: Codable, Sendable {
     /// rolling window for privacy or storage reasons.
     public var retentionDays: Int
 
+    /// How often, in seconds, the engine re-attempts a full rebuild while
+    /// it sits in the `error` state (#109). Maps to the always-on plan's
+    /// `error_recovery_interval_secs` (camelCase here like every other
+    /// key).
+    ///
+    /// Before this existed, a U5 surrender while the Mac stayed awake
+    /// left the daemon dark until a client happened to send `start`; only
+    /// a wake rebuild (#112) could clear the error on its own. Each
+    /// attempt is bounded: at most one per interval, whichever trigger
+    /// fires (this timer or an audio device change), and never from a
+    /// surrender with no session to recover into.
+    ///
+    /// Default 60. `0` or a negative value turns off both automatic
+    /// triggers (the timer AND the device-change trigger) and the anchor
+    /// restore after a failed rebuild. `stop()` works from `error` at
+    /// every interval.
+    public var errorRecoveryIntervalSeconds: Int
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
@@ -138,7 +156,8 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
-        retentionDays: Int = 0
+        retentionDays: Int = 0,
+        errorRecoveryIntervalSeconds: Int = 60
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -155,6 +174,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.topicExtractionMinSegments = topicExtractionMinSegments
         self.retentionDays = retentionDays
+        self.errorRecoveryIntervalSeconds = errorRecoveryIntervalSeconds
     }
 
     // MARK: - Codable
@@ -178,6 +198,7 @@ public struct StenoSettings: Codable, Sendable {
         case emptySessionMinDurationSeconds
         case topicExtractionMinSegments
         case retentionDays
+        case errorRecoveryIntervalSeconds
     }
 
     public init(from decoder: Decoder) throws {
@@ -199,6 +220,9 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
+        // Absent in a settings file written before #109's timer: default
+        // on, so an upgraded install gets automatic recovery from `error`.
+        self.errorRecoveryIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .errorRecoveryIntervalSeconds) ?? 60
     }
 
     // MARK: - Persistence
