@@ -123,7 +123,10 @@ struct RunCommand: ParsableCommand {
                     reArmIdleOnWake: settings.reArmIdleOnWake,
                     // #62: real Layer-A availability gate (hardware + ASR asset).
                     // Tests default to the permissive `ReadyTranscriptionModelGate`.
-                    transcriptionGate: DefaultTranscriptionModelGate()
+                    transcriptionGate: DefaultTranscriptionModelGate(),
+                    // #109: periodic + device-change recovery from `.error`.
+                    // `<= 0` disables it.
+                    errorRecoveryInterval: .seconds(settings.errorRecoveryIntervalSeconds)
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)

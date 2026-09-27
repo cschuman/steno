@@ -35,6 +35,26 @@ final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
     /// Total mic source creations (rebuild count).
     private(set) var micCreateCount: Int = 0
 
+    /// When set, every `makeMicrophoneSource` call parks on this gate
+    /// before doing anything else, so a test can hold a bring-up
+    /// mid-flight and race a lifecycle command against it.
+    var micGate: AsyncGate?
+
+    /// When set, every mic source's stop closure parks on this gate
+    /// before stopping, so a test can hold a teardown mid-flight.
+    var micStopGate: AsyncGate?
+
+    private let liveLock = NSLock()
+    private var nextMicSourceID = 0
+    private var liveMicSourceIDs: Set<Int> = []
+
+    /// Mic sources handed out and not yet stopped. A value above 1 means
+    /// the engine leaked a capture pipeline. Stopping the same source
+    /// twice (two teardowns overlapping on one stop closure) counts once.
+    var liveMicSources: Int {
+        liveLock.withLock { liveMicSourceIDs.count }
+    }
+
     /// The mock system audio source returned by makeSystemAudioSource.
     let systemAudioSource = MockAudioSource(name: "Mock System Audio", sourceType: .systemAudio)
 
@@ -53,6 +73,9 @@ final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
 
     func makeMicrophoneSource(device: String?) async throws
         -> (buffers: AsyncStream<AVAudioPCMBuffer>, format: AVAudioFormat, stop: @Sendable () async -> Void) {
+        if let micGate {
+            await micGate.wait()
+        }
         micSourceCreated = true
         lastDevice = device
         micCreateCount += 1
@@ -75,8 +98,18 @@ final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
         self.micContinuation = continuation
         self.allMicContinuations.append(continuation)
 
-        let stop: @Sendable () async -> Void = { [continuation] in
+        let sourceID = liveLock.withLock {
+            let id = nextMicSourceID
+            nextMicSourceID += 1
+            liveMicSourceIDs.insert(id)
+            return id
+        }
+        let stop: @Sendable () async -> Void = { [continuation, self] in
+            if let gate = self.micStopGate {
+                await gate.wait()
+            }
             continuation.finish()
+            _ = self.liveLock.withLock { self.liveMicSourceIDs.remove(sourceID) }
         }
 
         return (buffers: stream, format: micFormat, stop: stop)

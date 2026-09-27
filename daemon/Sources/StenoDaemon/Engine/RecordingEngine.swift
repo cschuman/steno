@@ -418,6 +418,91 @@ public actor RecordingEngine {
     /// the suite no longer writes the user's settings file (#116).
     private let settingsStore: (any SettingsStoring)?
 
+    // MARK: - #109 automatic recovery from `.error`
+
+    /// How often the engine re-attempts a full rebuild while it sits in
+    /// `.error`. Triggers 2 and 3 of the always-on plan's "Engine-state
+    /// recovery from `error`" section: an audio device change, and a
+    /// coarse periodic re-attempt. Trigger 1 (pause/resume) already
+    /// existed, and #112 added wake. `<= .zero` turns off both triggers
+    /// and the anchor restore after a failed rebuild. `stop()` works from
+    /// `.error` at every interval.
+    /// Resolved from `StenoSettings.errorRecoveryIntervalSeconds`.
+    private let errorRecoveryInterval: Duration
+
+    /// Sleep used by the recovery timer. Production passes
+    /// `Task.sleep(for:)`; tests inject a sleeper they fire by hand. Same
+    /// contract as `backoffSleep`: it must throw when its task is
+    /// cancelled, or leaving `.error` cannot stop the loop.
+    private let errorRecoverySleep: @Sendable (Duration) async throws -> Void
+
+    /// The timer loop. Armed by `setStatus(.error)`, cancelled on every
+    /// transition out of `.error` and by `handleSystemWillSleep()`.
+    /// A repeated surrender while it runs does NOT restart it: a restart
+    /// would reset the wait, and a fault that re-surrenders faster than
+    /// the interval would starve the timer forever.
+    private var errorRecoveryTask: Task<Void, Never>?
+
+    /// The attempt currently rebuilding, from either trigger. Tracked as
+    /// a task rather than a flag so `stop()`, `pause()`, `start()` and
+    /// `handleSystemWillSleep()` can cancel it and wait for it to finish
+    /// before their own teardown. Without the wait, an attempt suspended
+    /// inside `bringUpPipelines` would resume after the user's command and
+    /// overtake it: its tail claims `.recording`, or on failure its
+    /// `cleanup()` wipes pause state and the anchor restore brings the
+    /// session back for the next firing.
+    private var errorRecoveryAttemptTask: Task<Void, Never>?
+
+    /// True for the whole of `rebuildAfterGap`, whether a wake or a
+    /// recovery attempt is running it. A recovery attempt never starts on
+    /// top of a wake rebuild.
+    private var gapRebuildInFlight: Bool = false
+
+    /// `nowProvider()` at the start of the most recent attempt. Rate limit
+    /// shared by both triggers: at most one attempt per interval.
+    private var lastErrorRecoveryAttemptAt: Date?
+
+    /// Start of the current stretch in `.error`. Feeds the heal rule's
+    /// gap, so a long outage rolls the session over exactly as a long
+    /// sleep would. Cleared on `.recording`, `.idle` and `.paused`.
+    private var errorEnteredAt: Date?
+
+    /// Whether the latest surrender was a revoked grant. The timer never
+    /// retries one: a TCC grant does not come back on its own, and a
+    /// retry every minute would only re-surrender. `setStatus(.error)`
+    /// clears it and the permission paths set it right after, so the
+    /// latest surrender's cause wins. A device change may still attempt,
+    /// subject to the mic preflight.
+    private var lastSurrenderWasPermission: Bool = false
+
+    /// Bumped by every user or system lifecycle command (`start`, `stop`,
+    /// `pause`, `resume`, `handleSystemWillSleep`) that acts, just after
+    /// its last guard. A rejected command does not count: a `start()` a
+    /// client sends during a wake rebuild throws `alreadyRecording`, and
+    /// if it still bumped this, the failed rebuild would lose its anchor
+    /// and recovery would stay dead until an explicit start.
+    /// `rebuildAfterGap` snapshots it and restores the anchor after a
+    /// failed bring-up only if it has not moved. `stop()` and `pause()`
+    /// do not wait for a WAKE rebuild, so without this a wake bring-up
+    /// that fails after the user stopped would put the session back, and
+    /// the timer would start recording again one interval later.
+    private var lifecycleGeneration: Int = 0
+
+    /// Lifecycle commands (`start`, `stop`, `pause`, `resume`,
+    /// `handleSystemWillSleep`) running right now. No recovery attempt
+    /// starts while it is above 0. Every command that arrives while an
+    /// attempt is running waits for that attempt, concurrent commands
+    /// included (socket commands run concurrently), and an attempt that a
+    /// command cancelled before its rebuild skips the rebuild. Waiting for
+    /// an attempt that is already running is not enough on its own: a
+    /// command suspends many times (the wait itself, then its teardown),
+    /// and a device-change attempt that slipped in at one of those
+    /// suspensions would never be waited for, so its bring-up could claim
+    /// `.recording` after the command finished. Deliberately not a gate on
+    /// arming the loop: a `start()` that fails back into `.error` must
+    /// still leave a loop running.
+    private var lifecycleCommandsInFlight: Int = 0
+
     // MARK: - Init
 
     public init(
@@ -447,7 +532,11 @@ public actor RecordingEngine {
         micDiarizer: (any DiarizationService)? = nil,
         sysDiarizer: (any DiarizationService)? = nil,
         deviceEnumerator: any AudioInputDeviceEnumerating = CoreAudioInputDeviceEnumerator(),
-        micSilenceWarnAfter: Duration = .seconds(30)
+        micSilenceWarnAfter: Duration = .seconds(30),
+        errorRecoveryInterval: Duration = .seconds(60),
+        errorRecoverySleep: @Sendable @escaping (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -473,6 +562,8 @@ public actor RecordingEngine {
         self.pauseTimer = pauseTimer ?? PauseTimer()
         self.deviceEnumerator = deviceEnumerator
         self.reArmIdleOnWake = reArmIdleOnWake
+        self.errorRecoveryInterval = errorRecoveryInterval
+        self.errorRecoverySleep = errorRecoverySleep
         // The watchdog counts level-throttle ticks, so convert the
         // caller's duration into ticks at the throttle's fixed rate.
         let warnSeconds = Double(micSilenceWarnAfter.components.seconds)
@@ -502,9 +593,21 @@ public actor RecordingEngine {
         device: String? = nil,
         systemAudio: Bool = false
     ) async throws -> Session {
+        lifecycleCommandsInFlight += 1
+        defer { lifecycleCommandsInFlight -= 1 }
+
+        // #109: an automatic recovery attempt can be suspended inside
+        // `bringUpPipelines` right now. Let it finish first, so it cannot
+        // resume after this start and leave a second pipeline running.
+        // Loops and attempts only start in `.error`, so from any other
+        // status this returns at once, unless an attempt that just
+        // brought the engine up is still finishing.
+        await cancelErrorRecoveryAndWait()
+
         guard status == .idle || status == .error else {
             throw RecordingEngineError.alreadyRecording
         }
+        lifecycleGeneration += 1
 
         // Reset backoff state on every entry into `.starting`. This is
         // a no-op when we came from `.idle` (a fresh `BackoffPolicy` is
@@ -926,13 +1029,32 @@ public actor RecordingEngine {
 
     /// Stop recording and finalize the session.
     public func stop() async {
+        lifecycleCommandsInFlight += 1
+        defer { lifecycleCommandsInFlight -= 1 }
+
+        // #109: wait out an in-flight recovery attempt before anything
+        // else, so it cannot resume after this stop and claim
+        // `.recording`. The generation bump follows the wait and the
+        // guard: an attempt that failed while we waited has already put
+        // its anchor back, and the teardown below closes that row
+        // properly.
+        await cancelErrorRecoveryAndWait()
+
         // Allow stopping from `.recovering` too (U5): an in-flight
         // restart must be cancellable mid-backoff so user-initiated
         // teardown is not blocked by the wait.
+        //
+        // And from `.error` (#109). With automatic recovery retrying from
+        // `.error`, a stop that was a silent no-op there would be ignored
+        // and the next attempt would start recording again. From `.error`
+        // this runs the normal teardown: the anchor session row is closed,
+        // dedup and prune run, and the engine lands in `.idle`.
         guard status == .recording
             || status == .starting
             || status == .recovering
-            || status == .paused else { return }
+            || status == .paused
+            || status == .error else { return }
+        lifecycleGeneration += 1
 
         // U10: if we were paused, cancel the auto-resume timer and clear
         // pause-state markers. The DB anchor is left as-is (the user can
@@ -1101,6 +1223,22 @@ public actor RecordingEngine {
         if newStatus == .error {
             errorEpoch += 1
             wakeRearmFailed = false
+            // #109: remember when this error stretch began (a repeated
+            // surrender keeps the original start), reset the cause flag so
+            // the caller that surrendered for a permission reason can set
+            // it, and make sure a retry is scheduled.
+            errorEnteredAt = errorEnteredAt ?? nowProvider()
+            lastSurrenderWasPermission = false
+            armErrorRecoveryLoopIfNeeded()
+        } else {
+            // Only the LOOP is cancelled here, never an in-flight attempt:
+            // the attempt's own success path is what calls
+            // `setStatus(.recording)`.
+            errorRecoveryTask?.cancel()
+            errorRecoveryTask = nil
+            if newStatus == .recording || newStatus == .idle || newStatus == .paused {
+                errorEnteredAt = nil
+            }
         }
         // U6: power assertion lifecycle. Take on entry into `.recording`,
         // release on every transition OUT of `.recording`. Idempotent in
@@ -1477,6 +1615,7 @@ public actor RecordingEngine {
 
         await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
         await setStatus(.error)
+        lastSurrenderWasPermission = true
     }
 
     /// Compute a stable error code for backoff "same-error" tracking.
@@ -2150,6 +2289,7 @@ public actor RecordingEngine {
         if permissions.allGranted { return }
         if await permissionService.requestMicrophoneAccess() { return }
         await setStatus(.error)
+        lastSurrenderWasPermission = true
         let message = permissions.errorMessage ?? "Permissions denied"
         await emit(.error(message, isTransient: false))
         throw RecordingEngineError.permissionDenied(message)
@@ -2655,12 +2795,23 @@ public actor RecordingEngine {
     ///
     /// Cleanup is unconditional — runs even from `.error` state.
     public func handleSystemWillSleep() async {
+        lifecycleCommandsInFlight += 1
+        defer { lifecycleCommandsInFlight -= 1 }
+
         // U10: while paused, no audio is being captured and no power
         // assertion is held. Nothing to drain. The pause timer keeps
         // running through sleep (DispatchWallTime-based).
         if status == .paused {
             return
         }
+
+        // #109: the recovery timer must not fire across the sleep (the
+        // status does not change here when already `.error`, so
+        // `setStatus` would not cancel it), and an attempt suspended
+        // mid-bring-up must finish before the teardown below, or it would
+        // resume after it with capture running. Wake re-arms the loop.
+        await cancelErrorRecoveryAndWait()
+        lifecycleGeneration += 1
 
         // Stamp the gap moment before tearing anything down so the wake
         // handler can compute the elapsed time accurately.
@@ -2677,22 +2828,7 @@ public actor RecordingEngine {
         // (1) Stop pipelines and confirm stopped. Each `await` returns
         // only after the underlying handle / closure has finished its
         // teardown.
-        recognizerTask?.cancel()
-        recognizerTask = nil
-        await micRecognizerHandle?.stop()
-        micRecognizerHandle = nil
-        await micStopClosure?()
-        micStopClosure = nil
-
-        systemRecognizerTask?.cancel()
-        systemRecognizerTask = nil
-        await sysRecognizerHandle?.stop()
-        sysRecognizerHandle = nil
-        await systemAudioSource?.stop()
-        systemAudioSource = nil
-
-        levelThrottleTask?.cancel()
-        levelThrottleTask = nil
+        await tearDownCapturePipelines()
 
         // (2) Release the power assertion AFTER pipelines confirm
         // stopped. Releasing is idempotent — the .recording -> .recovering
@@ -2716,6 +2852,11 @@ public actor RecordingEngine {
     /// (reuse) or a fresh one (rollover). Re-acquires the power
     /// assertion via the `.recording` status transition.
     public func handleSystemDidWake() async {
+        // #109: willSleep cancelled the recovery loop. Every exit below
+        // re-arms it if the engine is still in `.error`, whether the wake
+        // had nothing to rebuild or the rebuild surrendered again.
+        defer { armErrorRecoveryLoopIfNeeded() }
+
         // No-op safety: if we never entered `.recording` (e.g., engine
         // was idle before sleep, paused, or error-with-no-session), we
         // have nothing to bring back up. This guards the test scenario
@@ -2766,15 +2907,50 @@ public actor RecordingEngine {
             return
         }
 
-        // A wake is a full rebuild, so it gets a full retry budget, for
-        // the same reason `start()` and `resume()` reset here: a prior
+        let gap = nowProvider().timeIntervalSince(gapStarted)
+        _ = await rebuildAfterGap(
+            session: session,
+            gap: gap,
+            reasonPrefix: "wake",
+            failureLabel: "Wake"
+        )
+    }
+
+    /// Rebuild both pipelines around `session` after a gap in capture,
+    /// letting the U6 heal rule choose between reusing the session and
+    /// rolling it over. Shared by the wake path and #109's recovery
+    /// attempts, so both make the same decisions and emit the same events.
+    ///
+    /// - Parameters:
+    ///   - session: the session to rebuild around (the recovery anchor).
+    ///   - gap: seconds without capture, fed to the heal rule.
+    ///   - reasonPrefix: prefix of the `.recovering(reason:)` event,
+    ///     `"<prefix>:gap=<N>s"`. `"wake"` reproduces the wake reason.
+    ///   - failureLabel: leads the failure messages. `"Wake"` reproduces
+    ///     the wake path's strings.
+    /// - Returns: the session this rebuild targeted: the original on
+    ///   reuse, the fresh one on rollover, or the original if the fresh
+    ///   session could not be opened.
+    @discardableResult
+    private func rebuildAfterGap(
+        session: Session,
+        gap: TimeInterval,
+        reasonPrefix: String,
+        failureLabel: String
+    ) async -> Session {
+        gapRebuildInFlight = true
+        defer { gapRebuildInFlight = false }
+        let entryGeneration = lifecycleGeneration
+        var target = session
+
+        // A gap rebuild is a full rebuild, so it gets a full retry budget,
+        // for the same reason `start()` and `resume()` reset here: a prior
         // surrender leaves `isExhausted == true`, and the first
-        // post-wake hiccup would short-circuit straight back to
-        // `recoveryExhausted` against a budget spent before the sleep.
+        // post-rebuild hiccup would short-circuit straight back to
+        // `recoveryExhausted` against a budget spent before the gap.
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
 
-        let gap = nowProvider().timeIntervalSince(gapStarted)
         let currentDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
         let outcome = HealRule.decide(
             gap: gap,
@@ -2783,12 +2959,12 @@ public actor RecordingEngine {
             thresholdSeconds: healThresholdSeconds
         )
 
-        await emit(.recovering(reason: "wake:gap=\(Int(gap.rounded()))s"))
+        await emit(.recovering(reason: "\(reasonPrefix):gap=\(Int(gap.rounded()))s"))
 
         switch outcome {
         case .reuseSession(let healMarker):
             // Stage the heal marker for the first segment of each
-            // rebuilt pipeline so the post-wake transcription carries
+            // rebuilt pipeline so the post-gap transcription carries
             // the U2-schema `heal_marker` annotation.
             pendingMicHealMarker = healMarker
             pendingSysHealMarker = healMarker
@@ -2806,7 +2982,7 @@ public actor RecordingEngine {
                 // bringUpPipelines transitions to .error on failure and
                 // emits a non-transient error event.
                 await emit(.error(
-                    "Wake (reuse) bring-up failed: \(error.localizedDescription)",
+                    "\(failureLabel) (reuse) bring-up failed: \(error.localizedDescription)",
                     isTransient: false
                 ))
             }
@@ -2815,10 +2991,11 @@ public actor RecordingEngine {
             // Close current session as `interrupted`. Use the same
             // path orphan-sweep uses (sweepActiveOrphans then
             // openFreshSession) since the active session is effectively
-            // an "orphan" of the pre-sleep capture.
+            // an "orphan" of the pre-gap capture.
             do {
                 let sweptIds = try await repository.sweepActiveOrphans()
                 let fresh = try await repository.openFreshSession(locale: currentLocale)
+                target = fresh
                 // U12: prune the just-closed session(s) if empty. Done
                 // AFTER opening the fresh session so the new session is
                 // already in place when the prune commits. The new
@@ -2838,12 +3015,208 @@ public actor RecordingEngine {
                 await emit(.healed(gapSeconds: gap))
             } catch {
                 await emit(.error(
-                    "Wake (rollover) failed: \(error.localizedDescription)",
+                    "\(failureLabel) (rollover) failed: \(error.localizedDescription)",
                     isTransient: false
                 ))
                 await setStatus(.error)
             }
         }
+
+        // #109: keep the recovery anchor through a failed bring-up.
+        // `bringUpPipelines`' mic-failure path runs `cleanup()`, which
+        // drops `currentSession`, so without this one failed attempt would
+        // end every later retry. The row is still `active` in the
+        // repository, and the surrender contract (see `currentSession`)
+        // is that `.error` keeps its session. Skipped when a lifecycle
+        // command ran meanwhile: a `stop()` or `pause()` that landed
+        // during a wake rebuild closed the session on purpose, and
+        // bringing it back would let the timer record again. Also skipped
+        // with recovery switched off, so interval 0 keeps a failed wake's
+        // earlier behavior (no session) exactly.
+        if errorRecoveryInterval > .zero
+            && status == .error
+            && currentSession == nil
+            && lifecycleGeneration == entryGeneration {
+            currentSession = target
+        }
+        return target
+    }
+
+    /// Stop both capture pipelines and wait until they have stopped:
+    /// recognizer consumers, recognizer handles, the mic source, the
+    /// system-audio source, and the level throttle. Each `await` returns
+    /// only after the underlying handle or closure has finished its
+    /// teardown. Shared by `handleSystemWillSleep()` and #109's recovery
+    /// attempt, which must clear whatever pipeline survived a one-sided
+    /// surrender before rebuilding both.
+    private func tearDownCapturePipelines() async {
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        levelThrottleTask?.cancel()
+        levelThrottleTask = nil
+    }
+
+    // MARK: - #109 Automatic recovery from `.error`
+
+    /// What asked for a recovery attempt. Only the timer is gated on the
+    /// cause of the surrender; both share the rate limit.
+    private enum ErrorRecoveryTrigger: String {
+        case timer
+        case deviceChange = "device-change"
+    }
+
+    /// Start the recovery timer if it should be running and is not. Sync
+    /// so it can run from a `defer`.
+    private func armErrorRecoveryLoopIfNeeded() {
+        guard errorRecoveryInterval > .zero,
+              errorRecoveryTask == nil,
+              status == .error else { return }
+        errorRecoveryTask = Task { [weak self] in
+            await self?.runErrorRecoveryLoop()
+        }
+    }
+
+    /// Sleep one interval, attempt, repeat, until cancelled. Cancellation
+    /// arrives from `setStatus` when the engine leaves `.error`, or from
+    /// `cancelErrorRecoveryAndWait()`.
+    private func runErrorRecoveryLoop() async {
+        repeat {
+            do {
+                try await errorRecoverySleep(errorRecoveryInterval)
+            } catch {
+                return
+            }
+            if Task.isCancelled { return }
+            await attemptErrorRecovery(trigger: .timer)
+        } while !Task.isCancelled
+    }
+
+    /// Cancel the recovery loop and any in-flight attempt, and wait for
+    /// both to unwind. Once this returns, the caller's own teardown cleans
+    /// up whatever the attempt built, and the attempt can no longer
+    /// overtake it.
+    ///
+    /// Each task stays in its slot while this waits, and a slot is cleared
+    /// only after its task has finished (and only if it still holds that
+    /// task). So a second command that arrives meanwhile (socket commands
+    /// run concurrently) finds the same tasks and waits for the same
+    /// attempt, instead of finding empty slots, acting at once, and being
+    /// overtaken by the attempt's bring-up tail.
+    ///
+    /// Repeats while either slot is non-nil. It terminates: while the old
+    /// loop still holds its slot, a failed attempt cannot arm another
+    /// loop, and a loop armed after a success followed by a new surrender
+    /// only sleeps, because the caller holds `lifecycleCommandsInFlight`
+    /// and no attempt can start. Must never be reached from inside an
+    /// attempt, or it would wait on its own task.
+    private func cancelErrorRecoveryAndWait() async {
+        while errorRecoveryTask != nil || errorRecoveryAttemptTask != nil {
+            let loop = errorRecoveryTask
+            let attempt = errorRecoveryAttemptTask
+            loop?.cancel()
+            attempt?.cancel()
+            await loop?.value
+            await attempt?.value
+            if errorRecoveryTask == loop { errorRecoveryTask = nil }
+            if errorRecoveryAttemptTask == attempt { errorRecoveryAttemptTask = nil }
+        }
+    }
+
+    private var errorRecoveryIntervalSeconds: TimeInterval {
+        let comps = errorRecoveryInterval.components
+        return TimeInterval(comps.seconds) + TimeInterval(comps.attoseconds) / 1e18
+    }
+
+    /// Whether a recovery attempt may run right now, excluding the mic
+    /// preflight. Read before and again after the preflight's `await`,
+    /// since the actor can be re-entered across it.
+    private func errorRecoveryAllowed(trigger: ErrorRecoveryTrigger) -> Bool {
+        guard errorRecoveryInterval > .zero,
+              lifecycleCommandsInFlight == 0,
+              status == .error,
+              !isStopping,
+              gapStartedAt == nil,
+              errorRecoveryAttemptTask == nil,
+              !gapRebuildInFlight,
+              micRestartTask == nil,
+              sysRestartTask == nil else { return false }
+        // No anchor means the error came from a failure before any session
+        // existed, and an explicit `start` is required. Daemon start can
+        // reach `.error` (orphan-sweep failure) BEFORE its privacy-critical
+        // pause-state check, so opening a session here could record
+        // through a persisted pause (plan risk R-F).
+        guard currentSession != nil else { return false }
+        if trigger == .timer && lastSurrenderWasPermission { return false }
+        // One attempt per interval, whichever trigger fires. This is what
+        // keeps headset renegotiation churn (#118) to one rebuild.
+        if let last = lastErrorRecoveryAttemptAt,
+           nowProvider().timeIntervalSince(last) < errorRecoveryIntervalSeconds {
+            return false
+        }
+        return true
+    }
+
+    /// One bounded attempt to leave `.error` with a full rebuild around
+    /// the surviving session, through the same helper as wake. U5's
+    /// restart path cannot do this: `beginRecovering` does not leave
+    /// `.error` and `maybeRestoreRecordingStatus` refuses to act in it.
+    ///
+    /// Silent when it declines: it is asked every interval, so the early
+    /// returns log nothing. The only events are the helper's.
+    private func attemptErrorRecovery(trigger: ErrorRecoveryTrigger) async {
+        guard errorRecoveryAllowed(trigger: trigger),
+              let anchor = currentSession else { return }
+
+        // A revoked microphone grant can surface at bring-up as a generic
+        // audio-source failure, so the cause flag alone does not catch it.
+        // `checkPermissions()` reads the recorded answer and never prompts.
+        let permissions = await permissionService.checkPermissions()
+        guard permissions.microphoneGranted, !Task.isCancelled else { return }
+
+        guard errorRecoveryAllowed(trigger: trigger),
+              currentSession?.id == anchor.id else { return }
+
+        lastErrorRecoveryAttemptAt = nowProvider()
+        let task: Task<Void, Never> = Task { [weak self] in
+            await self?.runErrorRecoveryAttempt(anchor: anchor, trigger: trigger)
+        }
+        errorRecoveryAttemptTask = task
+        await task.value
+        if errorRecoveryAttemptTask == task {
+            errorRecoveryAttemptTask = nil
+        }
+    }
+
+    private func runErrorRecoveryAttempt(anchor: Session, trigger: ErrorRecoveryTrigger) async {
+        // Clear whatever pipeline survived the surrender (for example the
+        // system pipeline after a mic-side surrender) so the rebuild does
+        // not leave two running.
+        await tearDownCapturePipelines()
+        // A lifecycle command that cancelled this attempt during the
+        // teardown is waiting for it and owns what happens next. Opening
+        // the mic now would only hand that command a pipeline to undo.
+        guard !Task.isCancelled else { return }
+
+        let now = nowProvider()
+        let gap = now.timeIntervalSince(errorEnteredAt ?? now)
+        await rebuildAfterGap(
+            session: anchor,
+            gap: gap,
+            reasonPrefix: "error-recovery:\(trigger.rawValue)",
+            failureLabel: "Error recovery"
+        )
     }
 
     // MARK: - U7 Device-Change Handler
@@ -2881,6 +3254,17 @@ public actor RecordingEngine {
         // active recording are uninteresting (no pipeline to
         // rebuild). Same gating as recognizer-error.
         if isStopping || status == .stopping || status == .idle {
+            return
+        }
+        // #109: in `.error` the U5 path below can only re-surrender (its
+        // policy is exhausted), emitting another `recoveryExhausted` and
+        // changing nothing. A full rebuild is the only way out, and a new
+        // device or a re-plugged mic is a good moment to try one. The rate
+        // limit inside keeps headset renegotiation churn (#118) to one
+        // rebuild per interval. With the interval disabled, device changes
+        // in `.error` behave exactly as before.
+        if status == .error && errorRecoveryInterval > .zero {
+            await attemptErrorRecovery(trigger: .deviceChange)
             return
         }
         // Drop duplicates while a mic restart is already running —
@@ -3049,6 +3433,9 @@ public actor RecordingEngine {
     ///   to fire `resume()` after this many seconds. The timer survives
     ///   sleep (`DispatchWallTime`). `nil` → indefinite pause, no timer.
     public func pause(autoResumeSeconds: TimeInterval?) async throws {
+        lifecycleCommandsInFlight += 1
+        defer { lifecycleCommandsInFlight -= 1 }
+
         // Allowed-from gate. From `.recording`, `.recovering`, or `.error`:
         // valid pause entry (R3 — pause is always available, even from a
         // surrendered engine). From `.paused`/`.starting`/`.stopping`/
@@ -3059,6 +3446,17 @@ public actor RecordingEngine {
         if pauseInProgress { throw RecordingEngineError.notRecording }
         pauseInProgress = true
         defer { pauseInProgress = false }
+
+        // #109: wait out an in-flight recovery attempt so it cannot
+        // resume after the pause and start capturing (privacy). The wait
+        // can change the status (the attempt may have reached
+        // `.recording`, or failed back into `.error`), so the gate is
+        // checked again afterwards.
+        await cancelErrorRecoveryAndWait()
+        guard status == .recording || status == .recovering || status == .error else {
+            throw RecordingEngineError.notRecording
+        }
+        lifecycleGeneration += 1
 
         // Cluster-4 review fix: if a `demarcate()` call was queued during
         // `.recovering` (pendingDemarcate=true) and the user pauses
@@ -3188,10 +3586,13 @@ public actor RecordingEngine {
     /// clears persisted pause state on the anchor session row, opens a
     /// fresh active session, and brings up pipelines around it.
     public func resume() async throws {
+        lifecycleCommandsInFlight += 1
+        defer { lifecycleCommandsInFlight -= 1 }
         guard status == .paused else {
             throw RecordingEngineError.notRecording
         }
         if pauseInProgress { throw RecordingEngineError.notRecording }
+        lifecycleGeneration += 1
         pauseInProgress = true
         defer { pauseInProgress = false }
 
@@ -3608,6 +4009,7 @@ extension RecordingEngine {
 
         await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
         await setStatus(.error)
+        lastSurrenderWasPermission = true
     }
 
     /// #42: park the sys pipeline because no display is attached.
