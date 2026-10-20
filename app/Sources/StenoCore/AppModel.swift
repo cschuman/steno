@@ -358,14 +358,11 @@ public final class AppModel {
             return
         }
         if message.hasPrefix("healed:") {
-            // Both states a heal can complete out of. `error` belongs
-            // here as much as `recovering` does: a heal that completes
-            // after a surrender is the evidence that the surrender is
-            // over (#109).
-            if status == .recovering || status == .error {
-                status = .recording
-                lastError = nil
-            }
+            // Only out of `recovering`. `healed:` is per-source and can
+            // land while the other source is still surrendered, so it is
+            // not evidence the engine left `error` (#112 review). The
+            // daemon's `status` event is, and it clears `lastError`.
+            if status == .recovering { status = .recording }
             return
         }
         if message.hasPrefix("recovery_exhausted:") {

@@ -62,7 +62,26 @@ struct RunCommand: ParsableCommand {
                 // coordinator, once for the engine), opening a small window
                 // where a settings-file write between reads would leave the
                 // two consumers disagreeing. See PR #36 review (Copilot).
-                let settings = StenoSettings.load()
+                //
+                // #116: the daemon is the only thing that owns the real
+                // settings file. It reads through the same store it later
+                // hands the engine, so there is one path to that file.
+                let settingsStore = FileSettingsStore()
+                let settings: StenoSettings
+                do {
+                    settings = try settingsStore.load()
+                } catch {
+                    // Present but unreadable. Start on defaults rather than
+                    // refusing to run, and say so — the engine's persistence
+                    // path hits the same error and declines to overwrite, so
+                    // the unreadable file stays put for the user to inspect.
+                    settings = StenoSettings()
+                    log.error("Could not read settings, starting on defaults: \(String(describing: error))")
+                    DaemonConsole.log(
+                        .warning,
+                        "Could not read \(settingsStore.url.path) — starting on defaults. The file was left unchanged."
+                    )
+                }
 
                 let summaryCoordinator = RollingSummaryCoordinator(
                     repository: repository,
@@ -95,6 +114,7 @@ struct RunCommand: ParsableCommand {
                     deviceUIDProvider: { defaultInputDeviceUID() },
                     healThresholdSeconds: settings.healGapSeconds,
                     audioBacklogCapSeconds: settings.audioBacklogCapSeconds,
+                    settingsStore: settingsStore,
                     dedupCoordinator: dedupCoordinator,
                     dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
                     emptySessionMinChars: settings.emptySessionMinChars,

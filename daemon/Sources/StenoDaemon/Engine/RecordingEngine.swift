@@ -467,6 +467,11 @@ public actor RecordingEngine {
     /// still leave a loop running.
     private var lifecycleCommandsInFlight: Int = 0
 
+    /// Where a successful `start(...)` persists the last-known audio config.
+    /// `nil` means no persistence at all — the test default, and the reason
+    /// the suite no longer writes the user's settings file (#116).
+    private let settingsStore: (any SettingsStoring)?
+
     // MARK: - Init
 
     public init(
@@ -481,9 +486,10 @@ public actor RecordingEngine {
         },
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
-        healThresholdSeconds: Int = 30,
+        healThresholdSeconds: Int = StenoSettings.defaultHealGapSeconds,
         audioBacklogCapSeconds: Double = 0,
         now: @Sendable @escaping () -> Date = { Date() },
+        settingsStore: (any SettingsStoring)? = nil,
         dedupCoordinator: DedupCoordinator? = nil,
         dedupTriggerDebounce: Duration = .seconds(5),
         emptySessionMinChars: Int = 20,
@@ -515,6 +521,7 @@ public actor RecordingEngine {
         self.healThresholdSeconds = healThresholdSeconds
         self.audioBacklogCapSeconds = audioBacklogCapSeconds
         self.nowProvider = now
+        self.settingsStore = settingsStore
         self.dedupCoordinator = dedupCoordinator
         self.dedupTriggerDebounce = dedupTriggerDebounce
         self.emptySessionMinChars = emptySessionMinChars
@@ -622,12 +629,31 @@ public actor RecordingEngine {
     /// is non-fatal: we emit a transient error event and continue. The
     /// recording session is unaffected — settings persistence is a
     /// next-launch convenience, not a runtime requirement.
+    ///
+    /// No store means no persistence (#116). Only `RunCommand` hands the
+    /// engine a `FileSettingsStore`; tests construct engines without one
+    /// and so cannot reach the user's settings file at all.
     private func persistLastKnownAudioConfig(device: String?, systemAudio: Bool) async {
-        var settings = StenoSettings.load()
+        guard let settingsStore else { return }
+
+        var settings: StenoSettings
+        do {
+            settings = try settingsStore.load()
+        } catch {
+            // The file exists but could not be read. Writing here would
+            // mean writing defaults over settings the user still has, so
+            // report it and leave the file alone.
+            await emit(.error(
+                "Skipped saving last-known audio config: could not read settings: \(error)",
+                isTransient: true
+            ))
+            return
+        }
+
         settings.lastDevice = device
         settings.lastSystemAudioEnabled = systemAudio
         do {
-            try settings.save()
+            try settingsStore.save(settings)
         } catch {
             await emit(.error("Failed to save last-known audio config: \(error)", isTransient: true))
         }
@@ -2720,6 +2746,14 @@ public actor RecordingEngine {
             // and an explicit `start` is required.
             return
         }
+
+        // A wake is a full rebuild, so it gets a full retry budget, for
+        // the same reason `start()` and `resume()` reset here: a prior
+        // surrender leaves `isExhausted == true`, and the first
+        // post-wake hiccup would short-circuit straight back to
+        // `recoveryExhausted` against a budget spent before the sleep.
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
 
         let gap = nowProvider().timeIntervalSince(gapStarted)
         _ = await rebuildAfterGap(
