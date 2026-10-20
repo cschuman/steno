@@ -61,10 +61,14 @@ rebuilding, as `start()` and `resume()` already do. A wake is a full rebuild and
 gets a full retry budget; without it, the first post-wake hiccup short-circuits
 straight back to `recoveryExhausted` against a budget spent before the sleep.
 
-Client side, both UIs cleared a `healed:` only from `recovering`, never from
-`error` — the same shape in two languages. A heal that completes after a
-surrender is exactly the evidence the surrender is over, so both now clear from
-either state and drop the stale error text with it.
+Client side, the clients leave `error` on the daemon's `status` event, which
+the wake rebuild's `setStatus(.recording)` emits. The menu-bar app already
+cleared its error text there; the TUI now does too. The first version of this
+change also cleared `error` on `healed:`, and review reverted that part.
+`healed:` is per-source: a system-audio restart can heal while the microphone
+is still surrendered, and the engine stays in `.error` with no status event to
+follow. Clearing on it would have shown recording with a source down and no
+power assertion held. `healed:` still leaves `recovering` only.
 
 ## Key Decisions
 
