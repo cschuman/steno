@@ -363,6 +363,10 @@ public final class AppModel {
             return
         }
         if message.hasPrefix("healed:") {
+            // Only out of `recovering`. `healed:` is per-source and can
+            // land while the other source is still surrendered, so it is
+            // not evidence the engine left `error` (#112 review). The
+            // daemon's `status` event is, and it clears `lastError`.
             if status == .recovering { status = .recording }
             return
         }

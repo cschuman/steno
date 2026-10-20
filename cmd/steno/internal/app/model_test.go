@@ -854,6 +854,64 @@ func TestHealedEventClearsRecovering(t *testing.T) {
 	}
 }
 
+// #112 review fix: `healed:` is per-source. A system-audio heal can land
+// while the microphone is still surrendered, so it is not evidence that
+// the engine left `error`. Only the daemon's own status event is.
+func TestHealedEventDoesNotClearError(t *testing.T) {
+	m := New()
+	transient := false
+	m.handleEvent(daemon.Event{
+		Event:     "error",
+		Message:   "recovery_exhausted: " + MicOrScreenPermissionRevoked,
+		Transient: &transient,
+	})
+
+	healedTransient := true
+	m.handleEvent(daemon.Event{
+		Event:     "error",
+		Message:   "healed: gap=3s",
+		Transient: &healedTransient,
+	})
+
+	if m.engineStatus != StatusError {
+		t.Errorf("engineStatus = %q, want error (a per-source heal is not a status change)", m.engineStatus)
+	}
+	if m.errorMessage == "" {
+		t.Error("errorMessage cleared by healed; the surrender is not over")
+	}
+}
+
+// #109: a wake rebuild out of `error` reaches `.recording` and the daemon
+// says so with a status event. That event must also drop the stale
+// surrender text, or the error bar outlives the error.
+func TestStatusRecordingClearsSurrenderError(t *testing.T) {
+	m := New()
+	transient := false
+	m.handleEvent(daemon.Event{
+		Event:     "error",
+		Message:   "recovery_exhausted: bring-up failed",
+		Transient: &transient,
+	})
+
+	// The wake rebuild's own sequence: `recovering:` first, then the
+	// status transition to recording.
+	recoveringTransient := true
+	m.handleEvent(daemon.Event{
+		Event:     "error",
+		Message:   "recovering: wake:gap=120s",
+		Transient: &recoveringTransient,
+	})
+	recording := true
+	m.handleEvent(daemon.Event{Event: "status", Recording: &recording})
+
+	if m.engineStatus != StatusRecording {
+		t.Errorf("engineStatus = %q, want recording", m.engineStatus)
+	}
+	if m.errorMessage != "" {
+		t.Errorf("errorMessage = %q, want cleared once the daemon reports recording", m.errorMessage)
+	}
+}
+
 func TestErrorRingBufferOverflow(t *testing.T) {
 	m := New()
 	for i := 0; i < 15; i++ {

@@ -51,8 +51,27 @@ public struct StenoSettings: Codable, Sendable {
     /// reuse the current session and stamp `heal_marker = "after_gap:<N>s"`
     /// on the next finalized segment. Larger gaps or device changes roll
     /// the session over (close as `interrupted`, open a fresh active).
-    /// Default: 30s per the plan.
+    /// Defaults to `defaultHealGapSeconds`.
     public var healGapSeconds: Int
+
+    /// Default reuse window for the U6 heal rule, in seconds.
+    ///
+    /// The original 30s was shorter than almost every real interruption.
+    /// Closing the lid to walk to another room, locking the screen for a
+    /// few minutes, a display sleep between two halves of the same
+    /// dictation — each one cleared 30s, so each one closed the session as
+    /// `interrupted` and opened a new one, splitting a single sitting into
+    /// pieces. Five minutes covers those. It stops well short of merging
+    /// genuinely separate sittings: a gap that long usually does mean the
+    /// user went and did something else.
+    ///
+    /// Raising this only reaches fresh installs. A successful start
+    /// persists the whole settings struct, so any install that has ever
+    /// recorded already has `healGapSeconds` on disk and keeps the value
+    /// it has. That is deliberate — a value already written may be a
+    /// deliberate choice, and silently rewriting it would be worse than
+    /// leaving it alone.
+    public static let defaultHealGapSeconds = 300
 
     /// Cap on how much un-transcribed audio may sit buffered ahead of the
     /// recognizer, in seconds. `0` disables shedding entirely.
@@ -123,6 +142,24 @@ public struct StenoSettings: Codable, Sendable {
     /// rolling window for privacy or storage reasons.
     public var retentionDays: Int
 
+    /// How often, in seconds, the engine re-attempts a full rebuild while
+    /// it sits in the `error` state (#109). Maps to the always-on plan's
+    /// `error_recovery_interval_secs` (camelCase here like every other
+    /// key).
+    ///
+    /// Before this existed, a U5 surrender while the Mac stayed awake
+    /// left the daemon dark until a client happened to send `start`; only
+    /// a wake rebuild (#112) could clear the error on its own. Each
+    /// attempt is bounded: at most one per interval, whichever trigger
+    /// fires (this timer or an audio device change), and never from a
+    /// surrender with no session to recover into.
+    ///
+    /// Default 60. `0` or a negative value turns off both automatic
+    /// triggers (the timer AND the device-change trigger) and the anchor
+    /// restore after a failed rebuild. `stop()` works from `error` at
+    /// every interval.
+    public var errorRecoveryIntervalSeconds: Int
+
     /// #111 — whether a wake re-applies the always-on arm rule when the
     /// engine is sitting in `.idle`.
     ///
@@ -148,7 +185,7 @@ public struct StenoSettings: Codable, Sendable {
         anthropicModel: String = "claude-3-5-haiku-20241022",
         lastDevice: String? = nil,
         lastSystemAudioEnabled: Bool = true,
-        healGapSeconds: Int = 30,
+        healGapSeconds: Int = StenoSettings.defaultHealGapSeconds,
         audioBacklogCapSeconds: Double = 0,
         dedupOverlapSeconds: Double = 3.0,
         dedupScoreThreshold: Double = 0.92,
@@ -158,6 +195,7 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
         retentionDays: Int = 0,
+        errorRecoveryIntervalSeconds: Int = 60,
         reArmIdleOnWake: Bool = false
     ) {
         self.summarizationProvider = summarizationProvider
@@ -175,6 +213,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.topicExtractionMinSegments = topicExtractionMinSegments
         self.retentionDays = retentionDays
+        self.errorRecoveryIntervalSeconds = errorRecoveryIntervalSeconds
         self.reArmIdleOnWake = reArmIdleOnWake
     }
 
@@ -199,6 +238,7 @@ public struct StenoSettings: Codable, Sendable {
         case emptySessionMinDurationSeconds
         case topicExtractionMinSegments
         case retentionDays
+        case errorRecoveryIntervalSeconds
         case reArmIdleOnWake
     }
 
@@ -209,7 +249,7 @@ public struct StenoSettings: Codable, Sendable {
         self.anthropicModel = try container.decodeIfPresent(String.self, forKey: .anthropicModel) ?? "claude-3-5-haiku-20241022"
         self.lastDevice = try container.decodeIfPresent(String.self, forKey: .lastDevice)
         self.lastSystemAudioEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastSystemAudioEnabled) ?? true
-        self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? 30
+        self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? Self.defaultHealGapSeconds
         // Absent in a settings file written before #84 — default off, so an
         // existing install keeps its complete-but-late behavior on upgrade.
         self.audioBacklogCapSeconds = try container.decodeIfPresent(Double.self, forKey: .audioBacklogCapSeconds) ?? 0
@@ -221,35 +261,9 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
+        // Absent in a settings file written before #109's timer: default
+        // on, so an upgraded install gets automatic recovery from `error`.
+        self.errorRecoveryIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .errorRecoveryIntervalSeconds) ?? 60
         self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? false
-    }
-
-    // MARK: - Persistence
-
-    private static var settingsURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let stenoDir = appSupport.appendingPathComponent("Steno")
-        return stenoDir.appendingPathComponent("settings.json")
-    }
-
-    /// Load settings from disk, or return defaults if not found.
-    public static func load() -> StenoSettings {
-        do {
-            let data = try Data(contentsOf: settingsURL)
-            return try JSONDecoder().decode(StenoSettings.self, from: data)
-        } catch {
-            return StenoSettings()
-        }
-    }
-
-    /// Save settings to disk.
-    public func save() throws {
-        let url = Self.settingsURL
-        let directory = url.deletingLastPathComponent()
-
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        let data = try JSONEncoder().encode(self)
-        try data.write(to: url)
     }
 }
