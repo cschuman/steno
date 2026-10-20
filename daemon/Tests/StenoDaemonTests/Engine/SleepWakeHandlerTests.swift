@@ -418,6 +418,86 @@ struct SleepWakeHandlerTests {
         await engine.stop()
     }
 
+    // MARK: - handleSystemDidWake heal rule (shipped default)
+
+    @Test("Default threshold: a 2-minute sleep keeps recording into the same session")
+    func wakeAfterAShortSleepReusesTheSessionAtTheDefaultThreshold() async throws {
+        // This is the user-visible contract of the shipped default, so the
+        // engine is built WITHOUT an explicit `healThresholdSeconds` — the
+        // point is what an un-configured daemon does. A lid closed for two
+        // minutes must not split the transcript.
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // initial start
+        let postWakeHandle = MockSpeechRecognizerHandle()
+        postWakeHandle.resultsToYield = [
+            RecognizerResult(text: "post-wake", isFinal: true, source: .microphone)
+        ]
+        rf.enqueueMicHandle(postWakeHandle)
+
+        // Injectable clock: first reading is the start, everything after
+        // willSleep reads two minutes later.
+        let baseTime = Date()
+        nonisolated(unsafe) var clockTick = 0
+        let clock: @Sendable () -> Date = {
+            if clockTick == 0 {
+                clockTick = 1
+                return baseTime
+            }
+            return baseTime.addingTimeInterval(120)
+        }
+
+        let repo = MockTranscriptRepository()
+        let summarizer = MockSummarizationService()
+        let af = MockAudioSourceFactory()
+        let del = MockRecordingEngineDelegate()
+        let coordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: summarizer,
+            triggerCount: 100,
+            timeThreshold: 3600
+        )
+        let power = MockPowerAssertion()
+        let perms = await MainActor.run { MockPermissionService() }
+        let engine = RecordingEngine(
+            repository: repo,
+            permissionService: perms,
+            summaryCoordinator: coordinator,
+            audioSourceFactory: af,
+            speechRecognizerFactory: rf,
+            delegate: del,
+            backoffSleep: { _ in },
+            powerAssertion: power,
+            deviceUIDProvider: { "BuiltInMic" },
+            // healThresholdSeconds deliberately omitted — the default is
+            // what is under test.
+            now: clock,
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
+        )
+
+        let session = try await engine.start()
+
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+
+        let landed = await waitFor {
+            let segs = (try? await repo.segments(for: session.id)) ?? []
+            return segs.contains { $0.healMarker != nil }
+        }
+        #expect(landed, "post-wake segment should heal into the original session")
+
+        // One session, not two: no rollover happened.
+        let sessions = try await repo.allSessions()
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.id == session.id)
+
+        let segments = try await repo.segments(for: session.id)
+        #expect(segments.last?.healMarker == "after_gap:120s")
+
+        await engine.stop()
+    }
+
     // MARK: - handleSystemDidWake heal rule (rollover via device change)
 
     @Test("Wake with different device → rollover even if gap is short")

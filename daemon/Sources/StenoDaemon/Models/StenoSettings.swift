@@ -51,8 +51,27 @@ public struct StenoSettings: Codable, Sendable {
     /// reuse the current session and stamp `heal_marker = "after_gap:<N>s"`
     /// on the next finalized segment. Larger gaps or device changes roll
     /// the session over (close as `interrupted`, open a fresh active).
-    /// Default: 30s per the plan.
+    /// Defaults to `defaultHealGapSeconds`.
     public var healGapSeconds: Int
+
+    /// Default reuse window for the U6 heal rule, in seconds.
+    ///
+    /// The original 30s was shorter than almost every real interruption.
+    /// Closing the lid to walk to another room, locking the screen for a
+    /// few minutes, a display sleep between two halves of the same
+    /// dictation — each one cleared 30s, so each one closed the session as
+    /// `interrupted` and opened a new one, splitting a single sitting into
+    /// pieces. Five minutes covers those. It stops well short of merging
+    /// genuinely separate sittings: a gap that long usually does mean the
+    /// user went and did something else.
+    ///
+    /// Raising this only reaches fresh installs. A successful start
+    /// persists the whole settings struct, so any install that has ever
+    /// recorded already has `healGapSeconds` on disk and keeps the value
+    /// it has. That is deliberate — a value already written may be a
+    /// deliberate choice, and silently rewriting it would be worse than
+    /// leaving it alone.
+    public static let defaultHealGapSeconds = 300
 
     /// Cap on how much un-transcribed audio may sit buffered ahead of the
     /// recognizer, in seconds. `0` disables shedding entirely.
@@ -129,7 +148,7 @@ public struct StenoSettings: Codable, Sendable {
         anthropicModel: String = "claude-3-5-haiku-20241022",
         lastDevice: String? = nil,
         lastSystemAudioEnabled: Bool = true,
-        healGapSeconds: Int = 30,
+        healGapSeconds: Int = StenoSettings.defaultHealGapSeconds,
         audioBacklogCapSeconds: Double = 0,
         dedupOverlapSeconds: Double = 3.0,
         dedupScoreThreshold: Double = 0.92,
@@ -187,7 +206,7 @@ public struct StenoSettings: Codable, Sendable {
         self.anthropicModel = try container.decodeIfPresent(String.self, forKey: .anthropicModel) ?? "claude-3-5-haiku-20241022"
         self.lastDevice = try container.decodeIfPresent(String.self, forKey: .lastDevice)
         self.lastSystemAudioEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastSystemAudioEnabled) ?? true
-        self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? 30
+        self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? Self.defaultHealGapSeconds
         // Absent in a settings file written before #84 — default off, so an
         // existing install keeps its complete-but-late behavior on upgrade.
         self.audioBacklogCapSeconds = try container.decodeIfPresent(Double.self, forKey: .audioBacklogCapSeconds) ?? 0
