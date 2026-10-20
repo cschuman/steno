@@ -82,9 +82,23 @@ unreadable in both UIs regardless, so both now say so:
   lands in `.idle`. What changes is that `.idle` is no longer terminal. That
   keeps every existing client and test working while reducing the blast
   radius of an unpaired `stop` (#110) from "forever" to "until the next wake".
-- **Off switch.** `reArmIdleOnWake` in `StenoSettings`, default `true`,
+- **Opt-in, default `false`.** `reArmIdleOnWake` in `StenoSettings`,
   decoded with `decodeIfPresent` so existing settings files are unaffected.
-  Anyone who wants `stop` to stay terminal sets it `false`.
+  This started as an off switch with a `true` default; review flipped it.
+  An incidental `stop` (a script, a test) and a deliberate privacy `stop`
+  are the same wire command, and only a pause writes an anchor, so a `true`
+  default would resume capture after a stop the user meant. With the
+  default, `stop` stays terminal and the UI change below is what makes the
+  stopped state visible. Set it `true` to get the self-healing wake.
+- **A failed re-arm retries on the next wake.** A re-arm whose `start()`
+  throws lands in `.error`, not `.idle`. `wakeRearmFailed` marks that one
+  cause, so the next wake tries again without turning wake into a retry
+  point for unrelated errors such as a revoked permission.
+- **A re-arm abandons if the system slept again while it was suspended.**
+  The anchor read and the `recovering:` emit both suspend the actor. If a
+  sleep lands meanwhile, `gapStartedAt` is set again, and starting would
+  bring capture up after that sleep's teardown. The re-arm checks it, and
+  that the engine is still idle, right before `start()`.
 - **`pauseAnchorState()` uses `nowProvider()`** where the daemon-start path
   used a bare `Date()`. Identical in production, since `nowProvider` defaults
   to `{ Date() }`, and testable everywhere else.
@@ -107,7 +121,12 @@ stop it over-reaching.
   an active pause, so the same wake re-arms.
 - `wakeFromIdleFailsSafeOnUnreadablePauseAnchor` — repository read fails;
   stays idle and emits the non-transient `pause_state_unverifiable` token.
-- `wakeFromIdleRespectsDisabledSetting` — the escape hatch.
+- `wakeFromIdleRespectsDisabledSetting` — the setting off (the default).
+- the review fixes: a failed re-arm is retried on the next wake, an
+  unrelated `.error` is not, and `wakeReArmAbandonsWhenSleepBeginsWhileSuspended`
+  parks the re-arm in its anchor read, runs a sleep, and asserts the engine
+  stays idle with no power assertion. That last one fails without the
+  `gapStartedAt` check.
 
 Plus one app test (`idleIsNotHealthyOnAnAlwaysOnDaemon`) and three TUI tests
 (`TestStatusLabelIdleReadsAsNotCapturing`, the legacy-`recording` guard, and

@@ -2547,6 +2547,18 @@ public actor RecordingEngine {
 
         await emit(.recovering(reason: "wake:rearm-from-idle"))
 
+        // #113 review fix: the anchor read and the emit above both
+        // suspend, and the actor can run another sleep (or a client
+        // command) meanwhile. `handleSystemDidWake` cleared `gapStartedAt`
+        // before calling here, so a non-nil value means the system has
+        // gone back to sleep since this wake; starting now would bring
+        // capture up, and take the power assertion, after that sleep's
+        // teardown. The next wake re-runs this rule.
+        guard gapStartedAt == nil,
+              status == .idle || (status == .error && wakeRearmFailed) else {
+            return
+        }
+
         do {
             try await start(
                 locale: currentLocale,

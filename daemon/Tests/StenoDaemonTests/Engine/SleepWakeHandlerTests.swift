@@ -819,4 +819,36 @@ struct SleepWakeHandlerTests {
         #expect(await engine.status == .error)
         #expect(!power.isAcquired)
     }
+
+    /// #113 review fix: a re-arm that suspends (here, inside its pause-anchor
+    /// read) must not call `start()` if the system went back to sleep while
+    /// it was suspended. Otherwise capture comes up, and the power assertion
+    /// is taken, after the second sleep's teardown already ran.
+    @Test func wakeReArmAbandonsWhenSleepBeginsWhileSuspended() async throws {
+        let (engine, repo, _, _, _, power) = await makeEngine(reArmIdleOnWake: true)
+
+        _ = try await engine.start()
+        await engine.stop()
+        #expect(await engine.status == .idle)
+
+        let (parked, parkedCont) = AsyncStream<Void>.makeStream()
+        let (release, releaseCont) = AsyncStream<Void>.makeStream()
+        await repo.setMostRecentlyModifiedSessionGate {
+            parkedCont.yield()
+            for await _ in release { break }
+        }
+
+        await engine.handleSystemWillSleep()
+        let wake = Task { await engine.handleSystemDidWake() }
+
+        // Wait until the re-arm is parked in its anchor read, then sleep.
+        for await _ in parked { break }
+        await engine.handleSystemWillSleep()
+
+        releaseCont.yield()
+        await wake.value
+
+        #expect(await engine.status == .idle)
+        #expect(!power.isAcquired)
+    }
 }
