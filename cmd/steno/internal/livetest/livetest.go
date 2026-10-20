@@ -38,6 +38,12 @@ type State struct {
 	Recording          bool
 	Paused             bool
 	PausedIndefinitely bool
+	// Device and SystemAudio are the capture config the daemon reported,
+	// so a restore can start it the way it was found. A bare `start` takes
+	// the default mic with system audio off, and the engine persists that
+	// as the last-known config.
+	Device      string
+	SystemAudio *bool
 }
 
 // Decision is the outcome of a gate check.
@@ -77,8 +83,11 @@ func GateState(st State) Decision {
 // capturing reports whether this state means capture was asked for.
 // `starting` counts: the bring-up is underway and reading it as "not
 // capturing" would make a restore stop a daemon that was coming up.
+// `recovering` counts for the same reason: it reports recording=false
+// while the engine rebuilds a pipeline it means to keep running.
 func capturing(st State) bool {
-	return st.Recording || st.Status == "recording" || st.Status == "starting"
+	return st.Recording || st.Status == "recording" || st.Status == "starting" ||
+		st.Status == "recovering"
 }
 
 // RestoreCommands returns the commands that put the daemon back into the
@@ -88,7 +97,7 @@ func capturing(st State) bool {
 func RestoreCommands(before, now State) []daemon.Command {
 	switch {
 	case capturing(before) && !capturing(now):
-		return []daemon.Command{{Cmd: "start"}}
+		return []daemon.Command{{Cmd: "start", Device: before.Device, SystemAudio: before.SystemAudio}}
 	case !capturing(before) && capturing(now):
 		return []daemon.Command{{Cmd: "stop"}}
 	}
@@ -105,6 +114,8 @@ func StateFromResponse(resp daemon.Response) State {
 		Recording:          deref(resp.Recording),
 		Paused:             deref(resp.Paused),
 		PausedIndefinitely: deref(resp.PausedIndefinitely),
+		Device:             resp.Device,
+		SystemAudio:        resp.SystemAudio,
 	}
 }
 

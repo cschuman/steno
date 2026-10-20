@@ -72,6 +72,12 @@ on.
   `derefInt` are duplicated there for the same reason — `smoke_test.go` is
   still in `package daemon` and needs the originals.
 
+- **Review fixes to the restore.** `recovering` counts as capture, since it
+  reports recording=false while the engine rebuilds a pipeline it means to
+  keep. And the restore's `start` carries the device and system-audio
+  setting the test found. A bare `start` takes the default mic with system
+  audio off, and the engine saves that as the last-known config.
+
 ## Testing
 
 Twelve unit tests for the pure policy in `internal/livetest`: the gate

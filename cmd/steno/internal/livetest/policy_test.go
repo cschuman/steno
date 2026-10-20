@@ -129,3 +129,42 @@ func TestStateFromResponseToleratesNilPointers(t *testing.T) {
 		t.Fatalf("nil pointers should read as false, got %+v", st)
 	}
 }
+
+func TestRestoreCommandsTreatsRecoveringAsCapture(t *testing.T) {
+	// #114 review: `recovering` reports recording=false, but the engine is
+	// rebuilding a pipeline it means to run. A test that found it there and
+	// left it idle has to start it again.
+	before := State{Status: "recovering"}
+	now := State{Status: "idle"}
+	got := RestoreCommands(before, now)
+	if len(got) != 1 || got[0].Cmd != "start" {
+		t.Fatalf("expected a single start, got %+v", got)
+	}
+}
+
+func TestRestoreCommandsRestartsWithTheCaptureConfigItFound(t *testing.T) {
+	// #114 review: a bare `start` takes the default mic and systemAudio=false,
+	// and the engine persists that as the last-known config. The restore has
+	// to put back the device and system-audio choice it found.
+	yes := true
+	before := State{Status: "recording", Recording: true, Device: "Studio Mic", SystemAudio: &yes}
+	now := State{Status: "idle"}
+	got := RestoreCommands(before, now)
+	if len(got) != 1 || got[0].Cmd != "start" {
+		t.Fatalf("expected a single start, got %+v", got)
+	}
+	if got[0].Device != "Studio Mic" {
+		t.Errorf("Device = %q, want %q", got[0].Device, "Studio Mic")
+	}
+	if got[0].SystemAudio == nil || !*got[0].SystemAudio {
+		t.Errorf("SystemAudio = %v, want true", got[0].SystemAudio)
+	}
+}
+
+func TestStateFromResponseReadsCaptureConfig(t *testing.T) {
+	no := false
+	st := StateFromResponse(daemon.Response{OK: true, Status: "recording", Device: "Studio Mic", SystemAudio: &no})
+	if st.Device != "Studio Mic" || st.SystemAudio == nil || *st.SystemAudio {
+		t.Fatalf("unexpected capture config: %+v", st)
+	}
+}
