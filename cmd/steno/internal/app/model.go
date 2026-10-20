@@ -1084,6 +1084,13 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			m.recording = *ev.Recording
 			if m.recording {
 				m.statusText = "Recording"
+				// #109: the daemon is the authority on leaving `error`.
+				// Once it reports recording, a surrender's text is stale.
+				// Unconditional, matching the menu-bar app: a wake out of
+				// `error` emits `recovering:` first, so by the time this
+				// arrives the model already reads `recovering`.
+				m.errorMessage = ""
+				m.errorTransient = false
 				m.engineStatus = StatusRecording
 				// Successful recording resumes clear permission-revoked.
 				m.permissionRevoked = false
@@ -1192,19 +1199,17 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			return nil
 
 		case strings.HasPrefix(ev.Message, "healed:"):
-			// The pipeline restart succeeded. Drop back to recording
-			// from either of the two states a heal can complete out
-			// of. The next `status` event will reaffirm.
+			// The pipeline restart succeeded. If we're still in
+			// recovering, drop back to recording. The next `status`
+			// event will reaffirm.
 			//
-			// `error` belongs here as much as `recovering` does: a
-			// heal that completes after a surrender is exactly the
-			// evidence that the surrender is over, and dropping it
-			// left the header pinned to `error` while transcription
-			// visibly continued (#109).
-			if m.engineStatus == StatusRecovering || m.engineStatus == StatusError {
+			// Not from `error` (#112 review): `healed:` is per-source,
+			// and a system-audio heal can land while the microphone is
+			// still surrendered. Leaving `error` waits for the daemon's
+			// own `status` event, which a successful wake rebuild emits
+			// (#109) and which also clears the stale error text.
+			if m.engineStatus == StatusRecovering {
 				m.engineStatus = StatusRecording
-				m.errorMessage = ""
-				m.errorTransient = false
 			}
 			// Refresh segment list from the DB so heal_marker columns
 			// arrive via SegmentsForRange / DB refresh paths. For now

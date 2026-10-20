@@ -109,6 +109,30 @@ struct AppModelTests {
         #expect(m.lastError?.contains("PERMISSION_REVOKED") == true)
     }
 
+    // #112 review fix: `healed:` is per-source and can land while the
+    // other source is still surrendered, so it must not clear `.error`.
+    @Test func healedDoesNotClearError() {
+        let m = makeModel()
+        m.apply(DaemonEvent(event: "error",
+                            message: "recovery_exhausted: MIC_OR_SCREEN_PERMISSION_REVOKED",
+                            transient: false))
+        m.apply(DaemonEvent(event: "error", message: "healed: gap=3s", transient: true))
+        #expect(m.status == .error)
+        #expect(m.lastError != nil)
+    }
+
+    // #109: the daemon's status event is the authoritative way out of
+    // `.error`, and it clears the stale surrender text.
+    @Test func statusRecordingClearsError() {
+        let m = makeModel()
+        m.apply(DaemonEvent(event: "error",
+                            message: "recovery_exhausted: bring-up failed",
+                            transient: false))
+        m.apply(DaemonEvent(event: "status", recording: true))
+        #expect(m.status == .recording)
+        #expect(m.lastError == nil)
+    }
+
     @Test func modelProcessingToggles() {
         let m = makeModel()
         m.apply(DaemonEvent(event: "model_processing", modelProcessing: true))
