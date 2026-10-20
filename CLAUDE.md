@@ -140,6 +140,7 @@ make sign-daemon        # Ad-hoc code-sign the release daemon binary
 make sign-daemon-debug  # Ad-hoc code-sign the debug daemon binary
 make test-daemon        # swift test (daemon only)
 make test-steno         # go test ./... (steno only)
+make test-live          # opt in to the mutating live-daemon tests (#110)
 make install            # Install signed binaries to ~/.local/bin
 make clean              # Remove all build artifacts
 ```
@@ -199,6 +200,32 @@ func TestProtocolRoundTrip(t *testing.T) {
     }
 }
 ```
+
+### Live-daemon tests (#110)
+
+Some Go tests connect to the real daemon on this machine over its socket.
+On a developer Mac that is the same daemon recording the developer, so the
+mutating ones — anything that sends `start`, `stop`, `pause` or
+`reconfigure` — are gated:
+
+```bash
+make test        # live mutating tests SKIP. Safe to run at any moment.
+make test-live   # STENO_LIVE_TESTS=1. Stops and starts your daemon.
+```
+
+A mutating live test must take its client from `livetest.Require(t)`. That
+helper enforces the gate, refuses to run while the daemon is paused, and
+restores the state it found in `t.Cleanup`. Do not hand-roll the socket
+check: before #110 every one of these tests ended on `stop` and nothing
+started the daemon again, so `make test` silently ended the user's
+recording for good.
+
+Read-only live tests (`status`, `devices`, `subscribe`) do not need the
+gate and stay ungated — see `internal/daemon/smoke_test.go`.
+
+Restoring is not the same as undoing. `stop` closes the session
+permanently; the restore can only start a new one. That is why the gate,
+not the restore, is the part that keeps `make test` safe.
 
 ### Test File Naming
 - Swift: Tests mirror source structure — `Models/Transcript.swift` → `Models/TranscriptTests.swift`

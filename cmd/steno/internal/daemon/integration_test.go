@@ -1,30 +1,25 @@
-package daemon
+// See the note in crash_test.go: the mutating live-daemon tests live in
+// the external test package so they can import internal/livetest (#110).
+package daemon_test
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/jwulff/steno/internal/daemon"
+	"github.com/jwulff/steno/internal/livetest"
 )
 
 // TestLiveDaemonStartStop tests starting and stopping recording via the daemon.
 // Uses a single connection for both commands and events, matching how the TUI works.
-// Skipped if the daemon socket doesn't exist.
+//
+// Mutating: gated behind STENO_LIVE_TESTS=1, state restored on cleanup.
 func TestLiveDaemonStartStop(t *testing.T) {
-	sockPath := SocketPath()
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-		t.Skip("daemon not running")
-	}
-
-	// Single client for commands
-	client, err := Connect(sockPath)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer client.Close()
+	client := livetest.Require(t)
 
 	// Check status first
-	resp, err := client.SendCommand(Command{Cmd: "status"})
+	resp, err := client.SendCommand(daemon.Command{Cmd: "status"})
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -32,15 +27,15 @@ func TestLiveDaemonStartStop(t *testing.T) {
 		resp.OK, derefBool(resp.Recording), resp.Status, resp.Device)
 
 	// Get devices
-	resp, err = client.SendCommand(Command{Cmd: "devices"})
+	resp, err = client.SendCommand(daemon.Command{Cmd: "devices"})
 	if err != nil {
 		t.Fatalf("devices: %v", err)
 	}
 	fmt.Printf("Devices: %v\n", resp.Devices)
 
 	// Start recording
-	ensureIdle(t, client)
-	resp, err = client.SendCommand(Command{Cmd: "start"})
+	livetest.EnsureIdle(t, client)
+	resp, err = client.SendCommand(daemon.Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -50,7 +45,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	fmt.Printf("Started: sessionId=%s recording=%v\n", resp.SessionID, derefBool(resp.Recording))
 
 	// Check status while recording
-	resp, err = client.SendCommand(Command{Cmd: "status"})
+	resp, err = client.SendCommand(daemon.Command{Cmd: "status"})
 	if err != nil {
 		t.Fatalf("status during recording: %v", err)
 	}
@@ -60,7 +55,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	fmt.Printf("During recording: recording=%v segments=%v\n", derefBool(resp.Recording), derefInt(resp.Segments))
 
 	// Stop recording (immediately, no delay)
-	resp, err = client.SendCommand(Command{Cmd: "stop"})
+	resp, err = client.SendCommand(daemon.Command{Cmd: "stop"})
 	if err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -70,7 +65,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	fmt.Printf("Stopped: recording=%v\n", derefBool(resp.Recording))
 
 	// Verify stopped
-	resp, err = client.SendCommand(Command{Cmd: "status"})
+	resp, err = client.SendCommand(daemon.Command{Cmd: "status"})
 	if err != nil {
 		t.Fatalf("status after stop: %v", err)
 	}
@@ -84,29 +79,20 @@ func TestLiveDaemonStartStop(t *testing.T) {
 
 // TestLiveDaemonEventStream tests subscribing to events and receiving them.
 // Uses a separate connection for the event stream.
-// Skipped if the daemon socket doesn't exist.
+//
+// Mutating: gated behind STENO_LIVE_TESTS=1, state restored on cleanup.
 func TestLiveDaemonEventStream(t *testing.T) {
-	sockPath := SocketPath()
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-		t.Skip("daemon not running")
-	}
-
-	// Command connection
-	cmdClient, err := Connect(sockPath)
-	if err != nil {
-		t.Fatalf("connect cmd: %v", err)
-	}
-	defer cmdClient.Close()
+	cmdClient := livetest.Require(t)
 
 	// Event connection
-	evClient, err := Connect(sockPath)
+	evClient, err := daemon.Connect(daemon.SocketPath())
 	if err != nil {
 		t.Fatalf("connect ev: %v", err)
 	}
 	defer evClient.Close()
 
 	// Subscribe on event connection
-	resp, err := evClient.SendCommand(Command{Cmd: "subscribe"})
+	resp, err := evClient.SendCommand(daemon.Command{Cmd: "subscribe"})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -115,8 +101,8 @@ func TestLiveDaemonEventStream(t *testing.T) {
 	}
 
 	// Start recording via command connection
-	ensureIdle(t, cmdClient)
-	resp, err = cmdClient.SendCommand(Command{Cmd: "start"})
+	livetest.EnsureIdle(t, cmdClient)
+	resp, err = cmdClient.SendCommand(daemon.Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -159,7 +145,7 @@ func TestLiveDaemonEventStream(t *testing.T) {
 	<-done
 
 	// Stop recording
-	resp, err = cmdClient.SendCommand(Command{Cmd: "stop"})
+	resp, err = cmdClient.SendCommand(daemon.Command{Cmd: "stop"})
 	if err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -177,4 +163,22 @@ func TestLiveDaemonEventStream(t *testing.T) {
 	if total == 0 {
 		t.Error("expected at least some events during 3s recording")
 	}
+}
+
+// derefBool and derefInt render optional protocol fields for log output.
+// `package daemon`'s copies in protocol_test.go are not visible from the
+// external test package, and smoke_test.go still needs those, so both
+// exist.
+func derefBool(b *bool) any {
+	if b == nil {
+		return "nil"
+	}
+	return *b
+}
+
+func derefInt(i *int) any {
+	if i == nil {
+		return "nil"
+	}
+	return *i
 }

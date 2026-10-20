@@ -2,22 +2,22 @@ package app
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/jwulff/steno/internal/daemon"
+	"github.com/jwulff/steno/internal/livetest"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // TestLiveTUIFlow exercises the full TUI model lifecycle against a running daemon.
-// Skipped if the daemon isn't running.
+//
+// Mutating: it stops and starts the real daemon, so livetest.Require gates
+// it behind STENO_LIVE_TESTS=1 and restores the state it found (#110).
 func TestLiveTUIFlow(t *testing.T) {
+	client := livetest.Require(t)
 	sockPath := daemon.SocketPath()
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-		t.Skip("daemon not running")
-	}
 
 	m := New()
 
@@ -30,11 +30,7 @@ func TestLiveTUIFlow(t *testing.T) {
 	fmt.Println("=== Initial View ===")
 	fmt.Println(view)
 
-	// Connect to daemon
-	client, err := daemon.Connect(sockPath)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	// Feed the gated connection into the model.
 	m, _ = applyUpdate(m, DaemonConnectedMsg{Client: client})
 	if !m.connected {
 		t.Fatal("expected connected")
@@ -77,12 +73,9 @@ func TestLiveTUIFlow(t *testing.T) {
 		t.Fatalf("subscribe failed: %s", subResp.Error)
 	}
 
-	// Start recording via command connection
-	// Always-on recording (#32) means the daemon may already be recording,
-	// in which case `start` fails. Stop first — safe either way (#87).
-	if _, err := client.SendCommand(daemon.Command{Cmd: "stop"}); err != nil {
-		t.Fatalf("stop before start: %v", err)
-	}
+	// Start recording via command connection. `start` against a recording
+	// daemon fails, so get to a known state first (#87).
+	livetest.EnsureIdle(t, client)
 
 	resp, err = client.SendCommand(daemon.Command{Cmd: "start"})
 	if err != nil {
@@ -167,9 +160,6 @@ func TestLiveTUIFlow(t *testing.T) {
 	if total == 0 {
 		t.Error("expected at least some events during 5s recording")
 	}
-
-	// Clean up
-	client.Close()
 }
 
 func applyUpdate(m Model, msg tea.Msg) (Model, tea.Cmd) {
